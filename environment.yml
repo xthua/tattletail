@@ -1,4 +1,4 @@
-me: tailocin_env
+name: tailocin_env
 
 channels:
   - bioconda
