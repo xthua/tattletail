@@ -1,0 +1,15 @@
+me: tailocin_env
+
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+  - biopython>=1.85
+  - prodigal>=2.6.3
+  - blast>=2.16.0
+  - pip
+  - pip:
+      - termcolor>=2.1.0
