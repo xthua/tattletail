@@ -48,6 +48,16 @@ pip install termcolor
 
 ---
 
+### Create environment from file
+
+Instead of installing packages individually, you can create the full environment with:
+
+```bash
+conda env create -f environment.yml
+conda activate tailocin_env
+
+---
+
 ## Requirements
 
 ### Python packages
