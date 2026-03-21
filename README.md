@@ -79,7 +79,7 @@ Required BLAST programs:
 
 Check installation:
 
-```bash
+```
 prodigal -v
 blastp -version
 makeblastdb -version
