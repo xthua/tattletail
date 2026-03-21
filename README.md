@@ -179,8 +179,7 @@ Build database:
 makeblastdb \
     -in database_tailocin.fasta \
     -dbtype prot \
-    -out database_tailocin \
-    -parse_seqids
+    -out database_tailocin 
 ```
 
 Important:
