@@ -55,6 +55,7 @@ Instead of installing packages individually, you can create the full environment
 ```bash
 conda env create -f environment.yml
 conda activate tailocin_env
+```
 
 ---
 
@@ -79,7 +80,7 @@ Required BLAST programs:
 
 Check installation:
 
-```
+```bash
 prodigal -v
 blastp -version
 makeblastdb -version
