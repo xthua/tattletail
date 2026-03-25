@@ -182,13 +182,6 @@ makeblastdb \
     -out database_tailocin 
 ```
 
-Important:
-
-The reference database file is not included in this repository  
-due to size and licensing considerations.
-
-Users must prepare their own database.
-
 ---
 
 ## Output
