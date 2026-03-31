@@ -228,3 +228,22 @@ less -R file.txt
 ```
 
 ---
+
+## Citation
+
+If you use **TattleTail** in your research, please cite our preprint:
+
+**TattleTail: A Pyocin / Tailocin Prediction Tool**  
+Pais, Rayhaan G., Chen, Weilian, Leptihn, Sebastian, Hua, Xiaoting, & Loh, Belinda (2026)  
+bioRxiv  
+DOI: [https://doi.org/10.64898/2026.03.25.712926](https://doi.org/10.64898/2026.03.25.712926)
+
+**BibTeX:**
+```bibtex
+@article{pais2026tattletail,
+  title   = {TattleTail: A Pyocin / Tailocin Prediction Tool},
+  author  = {Pais, Rayhaan G. and Chen, Weilian and Leptihn, Sebastian and Hua, Xiaoting and Loh, Belinda},
+  journal = {bioRxiv},
+  year    = {2026},
+  doi     = {10.64898/2026.03.25.712926}
+}
