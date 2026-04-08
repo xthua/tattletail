@@ -18,6 +18,7 @@ The tool supports both annotated and unannotated genome inputs and performs auto
 - Batch processing support
 - Plain text + colored ANSI summary reports
 - Result re-collection without re-running analysis
+- Genes annotations in pyocin-encoding gene cluster
 
 ---
 
@@ -40,7 +41,7 @@ conda activate tailocin
 Install dependencies:
 
 ```bash
-conda install -c bioconda prodigal blast biopython
+conda install -c bioconda prodigal blast biopython prokka
 pip install termcolor
 ```
 
@@ -71,6 +72,7 @@ conda activate tailocin_env
 
 - Prodigal ≥ 2.6.3
 - BLAST+ ≥ 2.16.0
+- Prokka ≥ 1.15.6
 
 Required BLAST programs:
 
@@ -85,6 +87,7 @@ prodigal -v
 blastp -version
 makeblastdb -version
 blastdbcmd -version
+prokka --version
 ```
 
 ---
@@ -197,6 +200,10 @@ tailocin_report.txt
 tailocin_report.json
 run.log
 cluster_annotation.tsv
+cluster_{n}_gene_list.tsv
+cluster_{n}_on_full_contig.gbk
+cluster_{n}_on_full_contig.gff3
+prokka_cluster_{n}
 ```
 
 Description:
@@ -209,6 +216,10 @@ Description:
 | tailocin_report.json | structured report |
 | run.log | execution log |
 | cluster_annotation.tsv | detailed cluster hits |
+| cluster_{n}_gene_list.tsv | gene cluster annotations list |
+| cluster_{n}_on_full_contig.gbk | detailed gene cluster annotations |
+| cluster_{n}_on_full_contig.gff3 | detailed gene cluster annotations |
+| prokka_cluster_{n} | prokka annotate dir |
 
 ---
 

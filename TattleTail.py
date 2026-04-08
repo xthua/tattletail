@@ -2,28 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-TattleTail: A Pyocin Prediction Tool (V1.0) 
-
-Features:
-- BLAST database self-check
-- Mixed FFN/FASTA input
-- Prodigal prediction or direct translation
-- BLASTP search, functional label mapping, window-based clustering, 
-- Four-step candidate evaluation
-- Batch summary reports (plain text + colored version)
-- Cluster hits annotations
- 
-Per-sample output files:
-  - query_proteins.faa
-  - blast_results.txt
-  - tailocin_report.txt
-  - tailocin_report.json
-  - run.log
-  - cluster_annotation.tsv
-
-Batch summary files generated in root directory (plain + colored versions)
+Tailocin Finder v1.1 (Full contig Prokka + core region filter)
+- Based on v1.0
 """
-
 
 import os
 import re
@@ -31,6 +12,8 @@ import sys
 import argparse
 import subprocess
 import json
+import shutil
+import tempfile
 from shutil import which
 from datetime import datetime
 from collections import defaultdict
@@ -39,6 +22,8 @@ from termcolor import colored
 from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from Bio.SeqFeature import SeqFeature, FeatureLocation
+
 
 # --------------------------- ANSI tools ---------------------------
 
@@ -61,39 +46,131 @@ def open_log_append(path):
 def split_csv(s):
     return [x.strip() for x in s.split(",") if x.strip()]
 
-# --------------------------- NEW: BLAST DB 自检 ---------------------------
+
+def check_prokka():
+    prokka_path = shutil.which("prokka")
+    if prokka_path is None:
+        raise RuntimeError(
+            "ERROR: Prokka not found in PATH.\n"
+            "Please install Prokka or activate the correct conda environment."
+        )
+    try:
+        subprocess.run(["prokka", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception:
+        raise RuntimeError("ERROR: Prokka detected but failed to run.\nPlease check your installation.")
+
+
+def parse_prokka_gff(gff_file):
+    """Parse Prokka GFF3 file and extract CDS features"""
+    genes = []
+    with open(gff_file) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            cols = line.strip().split("\t")
+            if len(cols) < 9 or cols[2] != "CDS":
+                continue
+            start = int(cols[3])
+            end = int(cols[4])
+            strand = cols[6]
+            attrs = {}
+            for x in cols[8].split(";"):
+                if "=" in x:
+                    k, v = x.split("=", 1)
+                    attrs[k] = v
+            gene = attrs.get("gene", attrs.get("locus_tag", attrs.get("ID", "")))
+            product = attrs.get("product", "Hypothetical protein")
+            genes.append({
+                "gene": gene,
+                "product": product,
+                "start": start,
+                "end": end,
+                "strand": strand
+            })
+    return genes
+
+
+def write_cluster_gene_list(outfile, genes):
+    """Write gene list in the required format"""
+    with open(outfile, "w") as f:
+        f.write("#\tGene\tGene product\tGenomic position\n")
+        for i, g in enumerate(genes, 1):
+            gene = g.get("gene", "")
+            product = g.get("product", "Hypothetical protein")
+            start = int(g["start"])
+            end = int(g["end"])
+            strand = g["strand"]
+            start_fmt = f"{start:,}"
+            end_fmt = f"{end:,}"
+            if strand == "-":
+                pos = f"Complement {start_fmt} - {end_fmt}"
+            else:
+                pos = f"{start_fmt} - {end_fmt}"
+            f.write(f"{i}\t{gene}\t{product}\t{pos}\n")
+
+
+def write_cluster_gff3(outfile, contig_id, genes):
+    """Generate standard GFF3 file for IGV/JBrowse/Artemis"""
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("##gff-version 3\n")
+        f.write(f"# Tailocin Finder v3.20 - Core pyocin cluster annotations\n")
+        f.write(f"# Contig: {contig_id}\n")
+        f.write(f"# Only core cluster genes annotated (absolute genomic coordinates)\n\n")
+        
+        for g in genes:
+            start = g["start"]
+            end   = g["end"]
+            strand = g["strand"]
+            gene   = g.get("gene", "unknown")
+            product = g.get("product", "Hypothetical protein")
+            
+            product_safe = product.replace(';', ',').replace('=', '_').replace('"', "'")
+            
+            attributes = (
+                f"ID={gene};"
+                f"Name={gene};"
+                f"gene={gene};"
+                f"locus_tag={gene};"
+                f"product={product_safe};"
+                f"Note=Core pyocin cluster gene (Tailocin Finder)"
+            )
+            
+            f.write(f"{contig_id}\tTailocinFinder\tCDS\t{start}\t{end}\t.\t{strand}\t0\t{attributes}\n")
+
+def write_cluster_annotation_tsv(path, clusters_eval):
+    """(3) Write annotation table: locus tag + alignment statistics for each hit"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("cluster_id\tcontig\tstart\tend\tgene_id\tfunction\tpident\tlength\tbitscore\tevalue\n")
+        for idx, c in enumerate(clusters_eval, 1):
+            if not c["is_candidate"]:
+                continue
+            members_sorted = sorted(c["members"], key=lambda x: x["start"])
+            for m in members_sorted:
+                f.write(
+                    f"{idx}\t{c['contig']}\t{m['start']}\t{m['end']}\t{m['q']}\t{m['func']}\t"
+                    f"{m['pident']:.2f}\t{m['length']}\t{m['bitscore']:.1f}\t{m['evalue']:.2e}\n"
+                )
+
+# --------------------------- BLAST DB self-check ---------------------------
 
 def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailocin"):
-    """
-    Check if the BLAST protein database is ready and consistent.
-    Exits with error message and makeblastdb command if not.
-    Args:
-        db_fasta: Path to the FASTA file used to build the database
-                  (also used for mapping subject ID → functional label)
-        db_name:  Prefix name of the BLAST database (used in blastp -db)
-    """
-    # 1) Check if the FASTA exists
     if not os.path.exists(db_fasta):
         if os.path.basename(db_fasta) == "database_tailocin.fasta":
-            print("database_tailocin.fasta not exists", file=sys.stderr)
+            print("ERROR: database_tailocin.fasta not exists", file=sys.stderr)
         else:
             print(f"[FATAL] DB FASTA not exists: {db_fasta}", file=sys.stderr)
         sys.exit(2)
-
-    # 2) Check if the index file exists: (protein library:. bin/. phr/. psq)
     idx_files = [db_name + ".pin", db_name + ".phr", db_name + ".psq"]
     have_index = all(os.path.exists(p) for p in idx_files)
     if not have_index:
         if which("makeblastdb") is None:
             print("[FATAL] makeblastdb not exists", file=sys.stderr)
-            print("        please install BLAST+: (conda install -c bioconda blast)", file=sys.stderr)
+            print("        Please install BLAST+ (e.g. conda install -c bioconda blast)", file=sys.stderr)
         cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
         print("[FATAL] BLAST database index not found:", db_name, file=sys.stderr)
-        print("        Please create an index first (copy the next command to run):", file=sys.stderr)
+        print("        Please create index with the following command:", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
         sys.exit(2)
-
-    # 3) Attempt to process:
     ok = True
     if which("blastdbcmd") is not None:
         try:
@@ -105,23 +182,19 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
             ok = False
     if not ok:
         cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
-        print("[FATAL] Database index found to exist but unreadable:", db_name, file=sys.stderr)
-        print("        Suggest rebuilding the index:", file=sys.stderr)
+        print("[FATAL] Database index exists but is unreadable:", db_name, file=sys.stderr)
+        print("        It is recommended to rebuild the index:", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
         sys.exit(2)
-
-    # 4) FASTA is newer than index file: WARNING
     try:
         fasta_mtime = os.path.getmtime(db_fasta)
         idx_mtime = min(os.path.getmtime(p) for p in idx_files)
         if fasta_mtime > idx_mtime:
             cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
-            print("[WARN] DB FASTA is newer than BLAST index. Suggest rebuilding the index.", file=sys.stderr)
+            print("[WARN] DB FASTA is newer than BLAST index. It is recommended to rebuild the index:", file=sys.stderr)
             print("       " + cmd, file=sys.stderr)
     except Exception:
         pass
-
-    # 5) Quick examination header format (at least two tokens, the second being a functional tag)
     bad = 0
     try:
         with open(db_fasta, "r", encoding="utf-8", errors="ignore") as f:
@@ -131,14 +204,15 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
                     if len(parts) < 2:
                         bad += 1
         if bad > 0:
-            print(f"[FATAL] In {db_fasta} there has {bad} header(s) didn't include second functional tag", file=sys.stderr)
-            print("        Must meet the format: '>ID LABEL [optional]'", file=sys.stderr)
+            print(f"[FATAL] {db_fasta} has {bad} headers without second token (function label).", file=sys.stderr)
+            print("        Header must satisfy format: '>ID LABEL [optional]'", file=sys.stderr)
             print("        Example: '>BAR70105.1 integrase_1 [Pseudomonas aeruginosa]'", file=sys.stderr)
             sys.exit(2)
     except Exception:
         pass
 
-# --------------------------- Dependency and Input Types ---------------------------
+
+# --------------------------- Other functions ------------------------------------
 
 def check_dependencies(require_prodigal=True, require_blastp=True):
     ok = True
@@ -155,17 +229,13 @@ def is_annotated_fasta(file_path):
         data = f.read(1024)
     return any(k in data.lower() for k in annotated_keywords)
 
-# --------------------------- FFN→FAA Translate ---------------------------
-
 def translate_ffn_to_faa(ffn_file, faa_file, genetic_code=11, partial_policy="trim", log_path=None):
     def log(msg):
         if log_path:
             with open(log_path, "a") as lf:
                 lf.write("[FFN_TRANSLATE] " + msg + "\n")
-
     records = []
     bad_chars = re.compile(r"[^ACGTN]")
-
     for record in SeqIO.parse(ffn_file, "fasta"):
         raw = str(record.seq).upper()
         clean = raw.replace("U", "T").replace("-", "")
@@ -175,7 +245,6 @@ def translate_ffn_to_faa(ffn_file, faa_file, genetic_code=11, partial_policy="tr
             if new_clean != clean:
                 log(f"{record.id}: removed non-ACGTN chars; {len(clean)}->{len(new_clean)} bp")
             clean = new_clean
-
         rem = len(clean) % 3
         if rem != 0:
             if partial_policy == "trim":
@@ -188,23 +257,20 @@ def translate_ffn_to_faa(ffn_file, faa_file, genetic_code=11, partial_policy="tr
             elif partial_policy == "skip":
                 log(f"{record.id}: length {len(clean)} not multiple of 3; skipped")
                 continue
-            elif partial_policy == "error":
-                raise ValueError(f"{record.id}: CDS length {len(clean)} not multiple of 3")
             else:
                 log(f"{record.id}: unknown partial_policy={partial_policy}; trimming by default")
                 clean = clean[:len(clean) - rem]
-
         prot = Seq(clean).translate(table=genetic_code, to_stop=True)
         protein_record = SeqRecord(prot, id=record.id, description=f"{record.description} | cds_len={len(clean)} policy={partial_policy}")
         records.append(protein_record)
-
     SeqIO.write(records, faa_file, "fasta")
-
-# --------------------------- Prodigal ---------------------------
 
 def prodigal_mode_fix(mode):
     mode = str(mode).lower()
-    return "meta" if mode == "meta" else "single"
+    if mode == "meta":
+        return "meta"
+    else:
+        return "single" 
 
 def run_prodigal(nucl_fasta, faa_out, prodigal_mode="meta", genetic_code=11, log_path=None):
     cmd = ["prodigal", "-i", nucl_fasta, "-a", faa_out, "-p", prodigal_mode_fix(prodigal_mode), "-q", "-g", str(genetic_code)]
@@ -219,8 +285,6 @@ def run_prodigal(nucl_fasta, faa_out, prodigal_mode="meta", genetic_code=11, log
             with open_log_append(log_path) as lf:
                 lf.write(f"[ERROR] {msg}\n")
         return False, msg
-
-# --------------------------- BLASTP ---------------------------
 
 def run_blastp(query_faa, db_name, out_file, evalue="1e-10", threads=None, log_path=None):
     cmd = [
@@ -243,8 +307,6 @@ def run_blastp(query_faa, db_name, out_file, evalue="1e-10", threads=None, log_p
                 lf.write(f"[ERROR] {msg}\n")
         return False, msg
 
-# --------------------------- Functional Mapping ---------------------------
-
 def parse_functional_mapping(database_fasta):
     id_to_function = {}
     id_to_label = {}
@@ -253,7 +315,7 @@ def parse_functional_mapping(database_fasta):
             if line.startswith('>'):
                 parts = line.strip().split()
                 prot_id = parts[0][1:]
-                label = parts[1]  # e.g., integrase_1
+                label = parts[1]
                 function = label.split('_')[0].lower()
                 id_to_function[prot_id] = function
                 id_to_label[prot_id] = label
@@ -265,7 +327,6 @@ def parse_all_hits(blast_file, id_to_function, id_to_label,
     found_functions = set()
     if not os.path.exists(blast_file):
         return hits, found_functions
-
     with open(blast_file, errors="ignore") as f:
         for line in f:
             cols = line.strip().split('\t')
@@ -277,17 +338,14 @@ def parse_all_hits(blast_file, id_to_function, id_to_label,
                 evalue = float(cols[10]); bits = float(cols[11])
             except ValueError:
                 continue
-
             if evalue > evalue_thr:   continue
             if pident < pident_thr:   continue
             if alen   < length_thr:   continue
             if bits   < bitscore_thr: continue
-
             func  = id_to_function.get(sseqid, "unknown")
             label = id_to_label.get(sseqid, sseqid)
             if func == "unknown":
                 continue
-
             hits.append({
                 "q": qseqid, "s": sseqid,
                 "func": func, "label": label,
@@ -296,8 +354,6 @@ def parse_all_hits(blast_file, id_to_function, id_to_label,
             })
             found_functions.add(func)
     return hits, found_functions
-
-# --------------------------- Parse Prodigal Coords ---------------------------
 
 def parse_prodigal_coords(faa_file):
     qcoords = {}
@@ -309,63 +365,45 @@ def parse_prodigal_coords(faa_file):
                 left  = parts[0].strip()
                 start = int(parts[1].strip())
                 end   = int(parts[2].strip())
-
                 base = left.split()[0].lstrip('>')
                 contig = base
                 if "_" in base:
                     prefix, tail = base.rsplit("_", 1)
                     if tail.isdigit():
                         contig = prefix
-
                 qcoords[rec.id] = (contig, min(start, end), max(start, end))
         except Exception:
             continue
     return qcoords
 
 def parse_ffn_header_coords(faa_file, log_path=None):
-    """
-    Recognized formats include:
-      >lcl|NC_004547.2_cds_... [location=complement(32..475)]
-      >ref|NZ_CP014999.1_cds_... [location=<1179..>2171]
-      >... [location=join(100..200,300..400)]
-    Return: { qseqid: (contig, start, end) }
-    """
     def log(msg):
         if log_path:
             with open(log_path, "a") as lf:
                 lf.write("[FFN_COORDS] " + msg + "\n")
-
     qcoords = {}
     for rec in SeqIO.parse(faa_file, "fasta"):
         hdr = rec.description
-        token = hdr.split()[0]  # 如 lcl|NC_004547.2_cds_WP_...
-
-        # grab <CONTIG> from <prefix>|<CONTIG>_cds...  
+        token = hdr.split()[0]
         m = re.search(r'^[^|]+\|(.+?)_cds', token)
         if m:
             contig = m.group(1)
         else:
             m2 = re.search(r'^[^|]+\|([^\s]+)', token)
             contig = m2.group(1) if m2 else re.split(r'_cds', token)[0]
-
-        # extract [location=...]
         m = re.search(r'\[location=([^\]]+)\]', hdr)
         if not m:
             continue
         loc = m.group(1)
-
-        # trim complement()/join()/order()
         loc_clean = loc
         for kw in ['complement', 'join', 'order']:
             loc_clean = re.sub(rf'{kw}\(', '(', loc_clean)
         loc_clean = loc_clean.replace('(', '').replace(')', '')
-
         starts, ends = [], []
         for part in loc_clean.split(','):
             part = part.strip()
             if not part:
                 continue
-            # Allow </> prefix
             mm = re.match(r'[<>]?(\d+)\.\.[<>]?(\d+)', part)
             if mm:
                 s = int(mm.group(1)); e = int(mm.group(2))
@@ -375,22 +413,13 @@ def parse_ffn_header_coords(faa_file, log_path=None):
                     continue
                 s = e = int(mm2.group(1))
             starts.append(s); ends.append(e)
-
         if not starts:
             continue
         s = min(starts); e = max(ends)
         if s > e:
             s, e = e, s
-
         qcoords[rec.id] = (contig, s, e)
-
-    if qcoords:
-        log(f"Parsed {len(qcoords)} coordinate entries from FFN-style headers.")
-    else:
-        log("No FFN-style coordinates parsed.")
     return qcoords
-
-# --------------------------- Clustering & Evaluation ---------------------------
 
 def join_hits_with_coords(hits, qcoords):
     ghits = []
@@ -409,7 +438,6 @@ def cluster_by_window(ghits, window_bp=10000):
     by_contig = defaultdict(list)
     for gh in ghits:
         by_contig[gh["contig"]].append(gh)
-
     clusters = []
     for contig, arr in by_contig.items():
         arr.sort(key=lambda x: x["start"])
@@ -440,15 +468,12 @@ def evaluate_clusters_strict(
     set_block = set(x.lower() for x in blockers)
     set_reg   = set(x.lower() for x in regulators)
     set_tox   = set(x.lower() for x in toxins)
-
     for clu in clusters:
         funcs = set(m["func"].lower() for m in clu["members"])
-
         step1_ok = set_flank.issubset(funcs)
         step2_ok = (len(funcs & set_block) == 0)
         step3_ok = set_reg.issubset(funcs)
         step4_ok = set_tox.issubset(funcs)
-
         results.append({
             "contig": clu["contig"],
             "start":  clu["start"],
@@ -464,77 +489,35 @@ def evaluate_clusters_strict(
     return results
 
 def trim_cluster_by_flanks(cluster_eval, flank_markers=("trpE","trpG")):
-    """
-    Redefine cluster boundaries as: after trpE end to before trpG start.
-    Handles reversed order by sorting flanks by position.
-    Remove flank genes from members.
-    Only applied if cluster is_candidate == True and both flanks exist.
-    """
     flank_set = set(x.lower() for x in flank_markers)
-
     for c in cluster_eval:
         if not c["is_candidate"]:
             continue
-
-        # Find trpE & trpG members
         flank_hits = [m for m in c["members"] if m["func"].lower() in flank_set]
-
         if len(flank_hits) < 2:
-            # log: missing flanks
-            print(f"[TRIM WARN] Cluster {c['contig']}:{c['start']}-{c['end']} missing both flanks for trim; skipping.", file=sys.stderr)
             continue
-
         trpE_hit = next((m for m in flank_hits if m["func"].lower() == "trpe"), None)
         trpG_hit = next((m for m in flank_hits if m["func"].lower() == "trpg"), None)
-
         if not trpE_hit or not trpG_hit:
-            print(f"[TRIM WARN] Cluster {c['contig']}:{c['start']}-{c['end']} missing trpE or trpG; skipping trim.", file=sys.stderr)
             continue
-
-        # Log: flanks location
-        print(f"[TRIM INFO] Cluster {c['contig']}:{c['start']}-{c['end']}", file=sys.stderr)
-        print(f"  trpE: {trpE_hit['start']}-{trpE_hit['end']}", file=sys.stderr)
-        print(f"  trpG: {trpG_hit['start']}-{trpG_hit['end']}", file=sys.stderr)
-
-        # Sort by start, find the left and right flags (ignore tags)
         flanks_sorted = sorted([trpE_hit, trpG_hit], key=lambda x: x["start"])
         left_flank = flanks_sorted[0]
         right_flank = flanks_sorted[1]
-
-        # Calculate the core boundary: from left end+1 to right start -1
         new_start = left_flank["end"] + 1
         new_end = right_flank["start"] - 1
-
-        # Check negative span
         if new_start > new_end:
-            print(f"[TRIM WARN] Negative core span: {new_start} > {new_end}; possible assembly issue or non-adjacent flanks. Skipping trim.", file=sys.stderr)
-            continue  # 跳过 trim，保持原 cluster，但仍移除 flanks 成员
-
-        # update cluster coords
+            continue
         c["start"] = new_start
         c["end"] = new_end
-
-        # remove all flanks from members, and filter out genes that exceed the new boundary
         new_members = []
         for m in c["members"]:
             if m["func"].lower() in flank_set:
                 continue
             if m["start"] >= new_start and m["end"] <= new_end:
                 new_members.append(m)
-
         c["members"] = new_members
-
-        # Update functions 
         c["funcs"] = set(m["func"].lower() for m in new_members)
-
-        # Output log
-        print(f"  Computed core: {new_start}..{new_end} ({(new_end - new_start + 1)/1000:.2f} kb)", file=sys.stderr)
-        print(f"  Retained members: {len(new_members)}", file=sys.stderr)
-
     return cluster_eval
-
-
-
 
 def top_hits_by_function(hits):
     best = {}
@@ -554,7 +537,6 @@ def top_hits_by_function(hits):
             }
     return best
 
-# --------------------------- Output ---------------------------
 def write_report_and_json(
     report_txt, report_json, sample_name, params,
     found_functions_global, clusters_eval,
@@ -568,16 +550,13 @@ def write_report_and_json(
                            else "0 potential tailocin-encoding biosynthetic gene clusters were identified.")
     else:
         conclusion_text = f"{n_cand} candidate cluster(s) identified."
-
     with open(report_txt, "w", encoding="utf-8") as rpt:
         rpt.write("Tailocin Finder Report (cluster-aware)\n")
         rpt.write("=====================================\n\n")
         rpt.write(f"Sample: {sample_name}\n")
         rpt.write(f"Params: {json.dumps(params, ensure_ascii=False)}\n\n")
-
         rpt.write("Note: Candidate clusters have been trimmed to exclude flanking trpE and trpG genes.\n")
         rpt.write("      The coordinates and gene list below represent the core pyocin region only.\n\n")
-
         rpt.write("Global summary (across all hits):\n")
         def _line(label, keys):
             states = [f"{k}:{'Y' if k.lower() in found_functions_global else 'N'}" for k in keys]
@@ -587,7 +566,6 @@ def write_report_and_json(
         rpt.write(_line("Toxins", toxin_markers))
         rpt.write(_line("Blockers", phage_blockers))
         rpt.write(f"  Block scope: {block_scope}\n\n")
-
         if clusters_eval:
             rpt.write("Cluster-level results:\n")
             for idx, c in enumerate(clusters_eval, 1):
@@ -606,12 +584,10 @@ def write_report_and_json(
                           + ("" if c['step4_ok'] else f" — {c['step4_reason']}") + "\n")
                 verdict = "TAILOCIN CANDIDATE ✅" if c["is_candidate"] else "not a candidate ❌"
                 rpt.write(f"  verdict: {verdict}\n")
-
                 if c["is_candidate"]:
                     rpt.write("\n  Core genes in this candidate cluster (sorted by genomic position):\n\n")
                     rpt.write("  function    label           locus_tag                   contig               start       end      %id   len   bitscore   evalue\n")
                     rpt.write("  " + "-" * 110 + "\n")
-
                     members_sorted = sorted(c["members"], key=lambda x: x["start"])
                     for m in members_sorted:
                         contig_disp = m["contig"][:20] + "..." if len(m["contig"]) > 20 else m["contig"]
@@ -624,13 +600,10 @@ def write_report_and_json(
                     rpt.write("\n")
                 else:
                     rpt.write("\n")
-
         else:
             rpt.write("No clusters produced or no hits with coordinates (see run.log).\n\n")
-
         rpt.write(f"Conclusion: {conclusion_text}\n")
 
-    # JSON section remain unchanged
     out = {
         "sample": sample_name,
         "params": params,
@@ -657,7 +630,6 @@ def write_report_and_json(
             },
             "top_hits": top_hits_by_function(c["members"])
         }
-        # Optional: If you want to record the member list in JSON as well
         if c["is_candidate"]:
             cluster_dict["core_members"] = [
                 {
@@ -675,7 +647,6 @@ def write_report_and_json(
                 for m in sorted(c["members"], key=lambda x: x["start"])
             ]
         out["clusters"].append(cluster_dict)
-
     with open(report_json, "w", encoding="utf-8") as jf:
         json.dump(out, jf, indent=2, ensure_ascii=False)
 
@@ -689,15 +660,12 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
                            else "0 potential tailocin-encoding biosynthetic gene clusters were identified.")
     else:
         conclusion_text = f"{n_cand} candidate cluster(s) identified."
-
     print("Tailocin Finder Report (cluster-aware)")
     print("=====================================\n")
     print(f"Sample: {sample_name}")
     print(f"Params: {json.dumps(params, ensure_ascii=False)}\n")
-
     print(colored("Note: Candidate clusters trimmed — excluding trpE & trpG flanks", "yellow"))
     print("      Shown below: core pyocin region only.\n")
-
     print("Global summary (across all hits):")
     def yn(key): return 'Y' if key.lower() in found_functions_global else 'N'
     print("  Flanks:     " + ", ".join([f"{k}:{yn(k)}" for k in flank_markers]))
@@ -705,7 +673,6 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
     print("  Toxins:     " + ", ".join([f"{k}:{yn(k)}" for k in toxin_markers]))
     print("  Blockers:   " + ", ".join([f"{k}:{yn(k)}" for k in phage_blockers]))
     print(f"  Block scope: {block_scope}\n")
-
     if clusters_eval:
         print("Cluster-level results:")
         for idx, c in enumerate(clusters_eval, 1):
@@ -721,12 +688,10 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
             print(f"    4) lysis genes:              {pf(c['step4_ok'])}" + ("" if c['step4_ok'] else f" — {c['step4_reason']}"))
             verdict = colored("TAILOCIN CANDIDATE ✅", "green") if c["is_candidate"] else colored("not a candidate ❌", "red")
             print(f"  verdict: {verdict}")
-
             if c["is_candidate"]:
                 print("\n  Core genes (sorted by position):")
                 print(colored("  function    label           locus_tag                   contig               start       end      %id   len   bitscore   evalue", "cyan"))
                 print("  " + "-" * 110)
-
                 members_sorted = sorted(c["members"], key=lambda x: x["start"])
                 for m in members_sorted:
                     contig_disp = m["contig"][:20] + "..." if len(m["contig"]) > 20 else m["contig"]
@@ -739,37 +704,26 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
                 print("")
             else:
                 print("")
-
     else:
         print("No clusters produced or no hits with coordinates (see run.log).\n")
-
     print(f"Conclusion: {conclusion_text}")
 
-
-# --------------------------- Batch compile ---------------------------
 def aggregate_batch_text(results_root, items, timestamp):
     n = len(items)
     base = f"allresultsof{n}samples_{timestamp}"
     plain_path = os.path.join(results_root, base + ".txt")
     colored_path = os.path.join(results_root, base + "_colored.txt")
     os.makedirs(results_root, exist_ok=True)
-
-    # ====================== PLAIN TEXT version ======================
     with open(plain_path, "w", encoding="utf-8") as out:
         out.write(f"# Tailocin Finder Batch Report — {n} samples — {timestamp}\n")
         out.write("# Each section below is the full content of per-sample tailocin_report.txt.\n\n")
-        
         out.write("## SUMMARY\n")
-        # New header: Add candidate_stans and cluster_stezes_kb
         out.write("No.\tsample\tcandidates\tbinary\tcandidate_spans\tcluster_sizes_kb\treport_dir\n")
-        
         for i, it in enumerate(items, 1):
             spans = it.get("candidate_spans", "")
             sizes = it.get("cluster_sizes_kb", "")
             out.write(f"{i}\t{it['sample']}\t{it['n_cand']}\t{it['binary']}\t{spans}\t{sizes}\t{it['dir']}\n")
-        
         out.write("\n## DETAILS\n\n")
-        
         for i, it in enumerate(items, 1):
             out.write(f"### [{i}] Sample: {it['sample']}  ({it['dir']})\n\n")
             try:
@@ -778,26 +732,19 @@ def aggregate_batch_text(results_root, items, timestamp):
                 out.write(content.rstrip() + "\n\n")
             except Exception as e:
                 out.write(f"[ERROR] Cannot read {it['report_txt']}: {e}\n\n")
-
-    # ====================== COLORED version ======================
     with open(colored_path, "w", encoding="utf-8") as outc:
         outc.write(f"# Tailocin Finder Batch Report — {n} samples — {timestamp}\n")
         outc.write("# ANSI-colored version. View with `less -R` or `cat` in a color-capable terminal.\n\n")
-        
         outc.write("## SUMMARY\n")
         outc.write("No.\tsample\tcandidates\tbinary\tcandidate_spans\tcluster_sizes_kb\treport_dir\n")
-        
         for i, it in enumerate(items, 1):
             spans = it.get("candidate_spans", "")
             sizes = it.get("cluster_sizes_kb", "")
             btxt = f"{it['binary']}"
             btxt_col = f"{ANSI_GREEN}{btxt}{ANSI_RESET}" if it['binary'] == 1 else f"{ANSI_RED}{btxt}{ANSI_RESET}"
-            # Optional: If size>10 kb, highlight in green (example)
             sizes_col = sizes if not sizes or float(sizes.split(';')[0]) <= 10 else f"{ANSI_GREEN}{sizes}{ANSI_RESET}"
             outc.write(f"{i}\t{it['sample']}\t{it['n_cand']}\t{btxt_col}\t{spans}\t{sizes_col}\t{it['dir']}\n")
-        
         outc.write("\n## DETAILS\n\n")
-        
         for i, it in enumerate(items, 1):
             outc.write(f"### [{i}] Sample: {it['sample']}  ({it['dir']})\n\n")
             try:
@@ -807,9 +754,7 @@ def aggregate_batch_text(results_root, items, timestamp):
                 outc.write(colored_content.rstrip() + "\n\n")
             except Exception as e:
                 outc.write(f"{ANSI_RED}[ERROR]{ANSI_RESET} Cannot read {it['report_txt']}: {e}\n\n")
-
     return plain_path, colored_path
-
 
 def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json="batch_report.json", do_print=False):
     records = []
@@ -820,11 +765,9 @@ def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json
                 with open(jpath, "r", encoding="utf-8") as f:
                     j = json.load(f)
                 params = j.get("params", {})
-                
                 cand_spans = []
-                cand_sizes_kb = []  # New: Used to store the size (kb) of each candidate cluster
-                cand_funcs = []     # Keep the original functions
-                
+                cand_sizes_kb = []
+                cand_funcs = []
                 for c in j.get("clusters", []):
                     if c.get("is_candidate"):
                         start = c.get("start")
@@ -835,7 +778,6 @@ def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json
                             cand_spans.append(span_str)
                             cand_sizes_kb.append(f"{size_kb:.2f}")
                         cand_funcs.append(",".join(c.get("functions", [])))
-                
                 rec = {
                     "sample": j.get("sample", os.path.basename(root)),
                     "candidates": j.get("candidates", 0),
@@ -847,30 +789,25 @@ def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json
                     "length": params.get("length", ""),
                     "bitscore": params.get("bitscore", ""),
                     "evalue": params.get("evalue", ""),
-                    "candidate_spans": ";".join(cand_spans),          # New added in 20260303
-                    "cluster_sizes_kb": ";".join(cand_sizes_kb),  # New added in 20260303
+                    "candidate_spans": ";".join(cand_spans),
+                    "cluster_sizes_kb": ";".join(cand_sizes_kb),
                     "candidate_functions": ";".join(cand_funcs),
                     "report_dir": root
                 }
                 records.append(rec)
             except Exception:
                 continue
-    
     records.sort(key=lambda r: r["sample"])
-    
-    # Modify headers: Add cluster_Sizes_kb and remove the contig part from the original candidate_stans (doon in 20260303)
     headers = [
         "sample", "candidates", "binary", "block_scope", "window", "min_cluster_span",
         "pident", "length", "bitscore", "evalue", 
         "candidate_spans", "cluster_sizes_kb", "candidate_functions", "report_dir"
     ]
-    
     with open(out_tsv, "w", encoding="utf-8") as tf:
         tf.write("\t".join(headers) + "\n")
         for r in records:
             row = [str(r.get(h, "")) for h in headers]
             tf.write("\t".join(row) + "\n")
-    
     agg = {
         "total_samples": len(records),
         "positives": sum(1 for r in records if int(r["candidates"]) > 0),
@@ -879,35 +816,26 @@ def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json
     }
     with open(out_json, "w", encoding="utf-8") as jf:
         json.dump(agg, jf, indent=2, ensure_ascii=False)
-    
     if do_print:
         print(f"Collected {len(records)} sample(s). Positives={agg['positives']}, Negatives={agg['negatives']}")
         for r in records:
             mark = colored("POS", "green") if int(r["candidates"]) > 0 else colored("NEG", "red")
             print(f"[{mark}] {r['sample']}  candidates={r['candidates']}  spans={r['candidate_spans']}  sizes_kb={r['cluster_sizes_kb']}")
-    
-    # Return records, in order to use aggregate_batch_text
-    return records 
+    return records
 
 
 # --------------------------- CLI ---------------------------
 
 EXAMPLES_TEXT = """\
 Examples:
-  # single sample(FASTA), 15kb window, cluster span ≥13.4kb
+  # Single sample (unannotated FASTA)
   python TattleTail.py genome.fna -o results --window 15000 --min-cluster-span 13400
-
-  # Batch process (mix .fna & .ffn)
-  python TattleTail.py assemblies/ dir_of_ffn/cds_from_genomic.ffn -o results --window 15000
-
-  # Specify database path and index prefix (relative path, without suffix)
-  python TattleTail.py genome.fna -o results --db-fasta database_tailocin.fasta --db-name database_tailocin
-
-  # Print each sample on the terminal (including color) and export the hit details TSV
+  # Batch mode
+  python Tattletail.py assemblies/ -o results --window 15000
+  # Print per-sample reports + export hit details
   python TattleTail.py genome.fna -o results --per-sample-stdout --force-stdout --dump-hits-tsv
-
-  # Re-summary and report (scan results root directory)
-  python TattleTail.py collect --results-root results --out-tsv all.tsv --out-json all.json --print
+  # Re-summarize previous results (no re-run)
+  python TattleTail.py collect --results-root results --out-tsv all_results.tsv --out-json all_results.json --print
 """
 
 class SmartHelp(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -920,118 +848,51 @@ def build_parser():
         formatter_class=SmartHelp,
         epilog=EXAMPLES_TEXT
     )
-
-    # analysis
     p.add_argument("inputs", nargs="*", help="Input files or directories (.fna/.fa/.fasta or .ffn)")
     p.add_argument("-o", "--outdir", default="results", help="Root output directory")
-
-    # database
-    p.add_argument("--db-fasta", default="database_tailocin.fasta", help="Tailocin DB FASTA (for label/function mapping)")
-    p.add_argument("--db-name",  default="database_tailocin",       help="BLAST DB prefix/name (blastp -db)")
-
-    # blast threshold
-    p.add_argument("--evalue",   type=float, default=1e-10, help="E-value cutoff (also passed to blastp)")
-    p.add_argument("--pident",   type=float, default=35.0,  help="Identity cutoff (percent)")
-    p.add_argument("--length",   type=int,   default=50,    help="Alignment length cutoff (aa)")
+    p.add_argument("--db-fasta", default="database_tailocin.fasta", help="Tailocin DB FASTA")
+    p.add_argument("--db-name",  default="database_tailocin",       help="BLAST DB prefix")
+    p.add_argument("--evalue",   type=float, default=1e-10, help="E-value cutoff")
+    p.add_argument("--pident",   type=float, default=35.0,  help="Identity cutoff")
+    p.add_argument("--length",   type=int,   default=50,    help="Alignment length cutoff")
     p.add_argument("--bitscore", type=float, default=50.0,  help="Bitscore cutoff")
     p.add_argument("--threads",  type=int,   default=None,  help="blastp threads")
-
-    # clustering
-    p.add_argument("--window", type=int, default=10000, help="Cluster window on same contig (bp)")
-    p.add_argument("--min-cluster-span", type=int, default=0, help="Minimum cluster total span to keep (bp). 13400 for strict")
-
-    # logic
-    p.add_argument("--block-scope", choices=["cluster","global"], default="cluster", help="Blocker scope: within cluster or genome-wide")
-    p.add_argument("--binary-output", action="store_true", help="Use binary wording in conclusion (0/1)")
-
-    # mode
-    p.add_argument("--prodigal-mode", choices=["meta","single"], default="meta", help="Prodigal mode for unannotated genomes")
-    p.add_argument("--genetic_code", type=int, default=11, help="NCBI translation table (11 for bacteria/archaea)")
-    p.add_argument("--ffn-partial", choices=["trim","pad","skip","error"], default="trim",
-                   help="When FFN CDS length mod 3 != 0: trim trailing, pad N, skip, or error")
-
-    # markers
+    p.add_argument("--window", type=int, default=10000, help="Cluster window (bp)")
+    p.add_argument("--min-cluster-span", type=int, default=0, help="Minimum cluster total span (bp)")
+    p.add_argument("--block-scope", choices=["cluster","global"], default="cluster", help="Blocker scope")
+    p.add_argument("--binary-output", action="store_true", help="Use binary wording in conclusion")
+    p.add_argument("--prodigal-mode", choices=["meta","single"], default="single", help="Prodigal mode")
+    p.add_argument("--genetic_code", type=int, default=11, help="NCBI translation table")
+    p.add_argument("--ffn-partial", choices=["trim","pad","skip","error"], default="trim", help="FFN partial policy")
     p.add_argument("--flanks",     default="trpE,trpG",                  help="Comma-separated flank markers")
     p.add_argument("--regulators", default="prtN,prtR",                  help="Comma-separated regulator markers")
     p.add_argument("--toxins",     default="holin,endolysin",            help="Comma-separated lysis markers")
     p.add_argument("--blockers",   default="capsid,terminase,integrase", help="Comma-separated phage blockers")
-
-    # outputs
-    p.add_argument("--summary-file", default="", help="Append per-sample summary to this TSV (sample, candidates, binary)")
+    p.add_argument("--summary-file", default="", help="Append per-sample summary to this TSV")
     p.add_argument("--per-sample-stdout", action="store_true", help="Echo per-sample report to stdout (colored)")
-    p.add_argument("--force-stdout", action="store_true", help="Force stdout even under non-tty (nohup)")
+    p.add_argument("--force-stdout", action="store_true", help="Force stdout even under non-tty")
     p.add_argument("--quiet", action="store_true", help="Do not print reports to stdout")
-    p.add_argument("--dump-hits-tsv", action="store_true", help="Write hits_with_coords.tsv for each sample")
-
-    # version
-    p.add_argument("--version", action="version", version="TattleTail(VERSION1.0)")
-
+    p.add_argument("--dump-hits-tsv", action="store_true", help="Write hits_with_coords.tsv")
+    p.add_argument("--version", action="version", version="Tailocin Finder v3.20 (Full contig Prokka)")
     return p
 
 def parse_args():
     if len(sys.argv) > 1 and sys.argv[1] == "collect":
-        cparser = argparse.ArgumentParser(
-            prog="tailocin_finder.py collect",
-            description="Collect per-sample JSON reports under a results root and write a batch summary (TSV/JSON).",
-            formatter_class=SmartHelp,
-            epilog=EXAMPLES_TEXT
-        )
-        cparser.add_argument("--results-root", default="results", help="Root directory to search recursively (use the same as --outdir when running)")
-        cparser.add_argument("--out-tsv", default="batch_report.tsv", help="Output TSV path")
-        cparser.add_argument("--out-json", default="batch_report.json", help="Output JSON path")
-        cparser.add_argument("--print", dest="do_print", action="store_true", help="Print brief summary to stdout")
-        
-       
+        cparser = argparse.ArgumentParser(prog="tailocin_finder.py collect", formatter_class=SmartHelp, epilog=EXAMPLES_TEXT)
+        cparser.add_argument("--results-root", default="results", help="Root directory")
+        cparser.add_argument("--out-tsv", default="batch_report.tsv", help="Output TSV")
+        cparser.add_argument("--out-json", default="batch_report.json", help="Output JSON")
+        cparser.add_argument("--print", dest="do_print", action="store_true", help="Print brief summary")
         args = cparser.parse_args(sys.argv[2:])
         return args, "collect"
-
     parser = build_parser()
-    # print help without parameters
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
-    
     return parser.parse_args(), "run"
 
-# --------------------------- main process ---------------------------
 
-def write_hits_tsv(path, ghits):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("qseqid\tcontig\tstart\tend\tfunc\tlabel\tpident\tlength\tbitscore\tevalue\n")
-        for h in ghits:
-            f.write("{q}\t{c}\t{s}\t{e}\t{func}\t{lab}\t{pi:.3f}\t{al}\t{bs:.1f}\t{ev:.2e}\n".format(
-                q=h["q"], c=h.get("contig",""), s=h.get("start",""), e=h.get("end",""),
-                func=h["func"], lab=h["label"], pi=h["pident"], al=h["length"],
-                bs=h["bitscore"], ev=h["evalue"]
-            ))
-
-def write_cluster_annotation_tsv(path, clusters_eval):
-    """
-    Write detailed annotation table for candidate clusters only.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("cluster_id\tcontig\tstart\tend\tgene_id\tfunction\tpident\tlength\tbitscore\tevalue\n")
-
-        for idx, c in enumerate(clusters_eval, 1):
-            if not c["is_candidate"]:
-                continue
-
-            # Sort by genomic location
-            members_sorted = sorted(c["members"], key=lambda x: x["start"])
-
-            for m in members_sorted:
-                f.write(
-                    f"{idx}\t"
-                    f"{c['contig']}\t"
-                    f"{m['start']}\t"
-                    f"{m['end']}\t"
-                    f"{m['q']}\t"
-                    f"{m['func']}\t"
-                    f"{m['pident']:.2f}\t"
-                    f"{m['length']}\t"
-                    f"{m['bitscore']:.1f}\t"
-                    f"{m['evalue']:.2e}\n"
-                )
+# --------------------------- Main analysis function ---------------------------
 
 def analyze_file(
     input_file, output_dir, db_name, db_fasta,
@@ -1097,25 +958,20 @@ def analyze_file(
     )
 
     clusters_eval = []
-
-    # global exclude(Optional)--This branch remains, but simplifies processing
     if block_scope == "global":
         has_global_blocker = any(b.lower() in found_functions_global for b in phage_blockers)
         if has_global_blocker:
-            # If there are blockers globally, report directly that there are no candidates
             params = {
                 "evalue": evalue_thr, "pident": pident_thr, "length": length_thr, "bitscore": bitscore_thr,
                 "window": window_bp, "min_cluster_span": (0 if min_cluster_span <= 0 else min_cluster_span),
                 "block_scope": block_scope
             }
             write_report_and_json(
-                report_txt, report_json,
-                sample_name, params,
-                found_functions_global, clusters_eval,  # clusters_eval still null value
+                report_txt, report_json, sample_name, params,
+                found_functions_global, clusters_eval,
                 flank_markers, regulatory_markers, toxin_markers, phage_blockers,
                 block_scope, binary_output
             )
-            # You can choose not to generate tsv because there are no candidates available
             n_cand = 0
             binary = 0
             if summary_file_path:
@@ -1128,43 +984,23 @@ def analyze_file(
                                         block_scope, binary_output)
             return {"ok": True, "sample": sample_name, "report_txt": report_txt, "n_cand": n_cand, "binary": binary, "dir": output_dir}
 
-    # Normal clustering process (regardless of whether block_stope is a cluster or global but without a blocker)
     ghits = []
     if window_bp and window_bp > 0:
         qcoords = parse_prodigal_coords(query_faa)
         if not qcoords:
             qcoords = parse_ffn_header_coords(query_faa, log_path=run_log)
-            if qcoords:
-                with open_log_append(run_log) as lf:
-                    lf.write("[INFO] Coordinates parsed from FFN-style headers.\n")
-        if not qcoords:
-            with open_log_append(run_log) as lf:
-                lf.write("[WARN] No coordinates parsed (Prodigal/FFN); clustering skipped.\n")
-        else:
+        if qcoords:
             ghits = join_hits_with_coords(hits, qcoords)
             if dump_hits_tsv and ghits:
                 write_hits_tsv(os.path.join(output_dir, "hits_with_coords.tsv"), ghits)
-                with open_log_append(run_log) as lf:
-                    lf.write(f"[INFO] Dumped hits_with_coords.tsv with {len(ghits)} rows.\n")
-            if not ghits:
-                with open_log_append(run_log) as lf:
-                    lf.write("[WARN] No hits with coordinates after filtering; clustering skipped.\n")
-            else:
+            if ghits:
                 clusters = cluster_by_window(ghits, window_bp=window_bp)
                 if min_cluster_span and min_cluster_span > 0:
-                    before = len(clusters)
                     clusters = [c for c in clusters if (c["end"] - c["start"] + 1) >= min_cluster_span]
-                    after = len(clusters)
-                    with open_log_append(run_log) as lf:
-                        lf.write(f"[INFO] Filtered clusters by min span {min_cluster_span} bp: {before} -> {after}\n")
                 clusters_eval = evaluate_clusters_strict(
-                    clusters,
-                    flank=tuple(flank_markers),
-                    blockers=tuple(phage_blockers),
-                    regulators=tuple(regulatory_markers),
-                    toxins=tuple(toxin_markers)
+                    clusters, flank=tuple(flank_markers), blockers=tuple(phage_blockers),
+                    regulators=tuple(regulatory_markers), toxins=tuple(toxin_markers)
                 )
-                # trim flanks
                 clusters_eval = trim_cluster_by_flanks(clusters_eval, flank_markers)
 
     params = {
@@ -1172,26 +1008,102 @@ def analyze_file(
         "window": window_bp, "min_cluster_span": (0 if min_cluster_span <= 0 else min_cluster_span),
         "block_scope": block_scope
     }
-
-    # write report
     write_report_and_json(
-        report_txt, report_json,
-        sample_name, params,
+        report_txt, report_json, sample_name, params,
         found_functions_global, clusters_eval,
         flank_markers, regulatory_markers, toxin_markers, phage_blockers,
         block_scope, binary_output
     )
 
-    # New: generate cluster_annotation.tsv(only have)
     n_cand = sum(1 for c in clusters_eval if c["is_candidate"])
+
     if n_cand > 0:
         annotation_path = os.path.join(output_dir, "cluster_annotation.tsv")
         write_cluster_annotation_tsv(annotation_path, clusters_eval)
         with open_log_append(run_log) as lf:
-            lf.write(f"[INFO] Wrote cluster_annotation.tsv with {n_cand} candidate clusters\n")
-    else:
-        with open_log_append(run_log) as lf:
-            lf.write("[INFO] No candidate clusters found, skipping cluster_annotation.tsv\n")
+            lf.write(f"[INFO] (3) Wrote cluster_annotation.tsv with {n_cand} candidate clusters\n")
+
+    # ====================== Full contig Prokka + core filter ======================
+    if n_cand > 0:
+        genome_dict = SeqIO.to_dict(SeqIO.parse(input_file, "fasta"))
+        for idx, c in enumerate([c for c in clusters_eval if c["is_candidate"]], 1):
+            contig_id = c["contig"]
+            if contig_id not in genome_dict:
+                with open_log_append(run_log) as lf:
+                    lf.write(f"[ERROR] Contig {contig_id} not found in input fasta.\n")
+                continue
+
+            prokka_dir = os.path.join(output_dir, f"prokka_cluster_{idx}")
+            gff_file = os.path.join(prokka_dir, f"{contig_id}.gff")
+
+            with open_log_append(run_log) as lf:
+                lf.write(f"[INFO] Running Prokka on full contig {contig_id} for cluster {idx}\n")
+
+            try:
+                cmd = [
+                    "prokka", "--outdir", prokka_dir, "--prefix", contig_id,
+                    "--kingdom", "Bacteria", "--force", "--quiet", "--cpus", "4",
+                    "--mincontiglen", "1", 
+                    "--proteins", db_fasta,
+                    "--fast",
+                    input_file                      # Use full genome/contig
+                ]
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+                if os.path.exists(gff_file):
+                    genes = parse_prokka_gff(gff_file)
+
+                    # Filter only genes inside the core cluster region
+                    core_start = c["start"]
+                    core_end   = c["end"]
+                    core_genes = [g for g in genes 
+                                  if core_start <= g["start"] <= core_end 
+                                  and core_start <= g["end"] <= core_end]
+
+                    # Write gene list
+                    gene_list_file = os.path.join(output_dir, f"cluster_{idx}_gene_list.tsv")
+                    write_cluster_gene_list(gene_list_file, core_genes)
+
+                    with open_log_append(run_log) as lf:
+                        lf.write(f"[INFO] (2) Wrote core gene list: {gene_list_file} ({len(core_genes)} genes)\n")
+
+                    # Generate full-contig GBK and GFF3 with only core genes
+                    full_record = genome_dict[contig_id]
+                    full_record.annotations["molecule_type"] = "DNA"
+                    full_record.features = []
+                    
+                    for g in core_genes:
+                        start = g["start"] - 1
+                        end   = g["end"]
+                        strand_val = 1 if g["strand"] == "+" else -1
+                        feature = SeqFeature(
+                            FeatureLocation(start, end, strand=strand_val),
+                            type="CDS",
+                            qualifiers={
+                                "gene": g.get("gene", "unknown"),
+                                "product": g.get("product", "Hypothetical protein"),
+                                "locus_tag": g.get("gene", "unknown")
+                            }
+                        )
+                        full_record.features.append(feature)
+                    
+                    full_gbk = os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gbk")
+                    SeqIO.write(full_record, full_gbk, "genbank")
+
+                    full_gff3 = os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gff3")
+                    write_cluster_gff3(full_gff3, contig_id, core_genes)
+
+                    with open_log_append(run_log) as lf:
+                        lf.write(f"[INFO] Generated cluster_{idx} full-contig GBK and GFF3\n")
+
+                else:
+                    with open_log_append(run_log) as lf:
+                        lf.write(f"[WARN] No GFF from Prokka for cluster {idx}\n")
+
+            except subprocess.CalledProcessError as e:
+                with open_log_append(run_log) as lf:
+                    lf.write(f"[ERROR] Prokka failed for cluster {idx}: returncode {e.returncode}\n")
+                continue
 
     binary = 1 if n_cand > 0 else 0
     if summary_file_path:
@@ -1200,10 +1112,12 @@ def analyze_file(
 
     should_print = per_sample_stdout and (sys.stdout.isatty() or force_stdout_flag) and (not quiet_flag)
     if should_print:
-        print_report_to_console(sample_name, params, found_functions_global, clusters_eval,
-                                flank_markers, regulatory_markers, toxin_markers, phage_blockers,
-                                block_scope, binary_output)
-    # calculate spans & sizes
+        print_report_to_console(
+            sample_name, params, found_functions_global, clusters_eval,
+            flank_markers, regulatory_markers, toxin_markers, phage_blockers,
+            block_scope, binary_output
+        )
+
     cand_spans = []
     cand_sizes_kb = []
     for c in clusters_eval:
@@ -1223,12 +1137,9 @@ def analyze_file(
         "n_cand": n_cand,
         "binary": binary,
         "dir": output_dir,
-        "candidate_spans": ";".join(cand_spans),          # 20260303
-        "cluster_sizes_kb": ";".join(cand_sizes_kb)       # 20260303
+        "candidate_spans": ";".join(cand_spans),
+        "cluster_sizes_kb": ";".join(cand_sizes_kb)
     }
-
-
-
 
 
 def list_input_files(paths):
@@ -1244,33 +1155,27 @@ def list_input_files(paths):
             print(f"[WARNING] Skipping unsupported input: {p}")
     return files
 
-def main():
-    args, mode = parse_args()
 
+def main():
+    check_prokka()
+    args, mode = parse_args()
     if mode == "collect":
         collect_reports(results_root=args.results_root, out_tsv=args.out_tsv, out_json=args.out_json, do_print=args.do_print)
         return
-
-    # Dependency check & BLAST library self-test
     check_dependencies(require_prodigal=True, require_blastp=True)
     ensure_blast_db(db_fasta=args.db_fasta, db_name=args.db_name)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     results_root = args.outdir
     os.makedirs(results_root, exist_ok=True)
-
     flank_markers      = split_csv(args.flanks)
     regulatory_markers = split_csv(args.regulators)
     toxin_markers      = split_csv(args.toxins)
     phage_blockers     = split_csv(args.blockers)
-
     processed = []
-
     input_files = list_input_files(args.inputs)
     if not input_files:
         print("[BATCH] No valid inputs found.")
         sys.exit(1)
-
     for input_file in input_files:
         sample_name = os.path.splitext(os.path.basename(input_file))[0]
         output_dir = os.path.join(results_root, f"{sample_name}_{timestamp}")
@@ -1284,8 +1189,8 @@ def main():
             per_sample_stdout=args.per_sample_stdout, summary_file_path=args.summary_file,
             dump_hits_tsv=args.dump_hits_tsv
         )
-        if rec: processed.append(rec)
-
+        if rec:
+            processed.append(rec)
     if processed:
         plain_path, colored_path = aggregate_batch_text(results_root, processed, timestamp)
         if not args.quiet:
@@ -1294,11 +1199,11 @@ def main():
             print(f"[BATCH] Samples processed: {len(processed)}  Positives: {pos}  Negatives: {neg}")
             print(f"[BATCH] Aggregated report (plain)  → {plain_path}")
             print(f"[BATCH] Aggregated report (colored)→ {colored_path}")
-            print("       View colored with: less -R <path>  (or cat)")
+            print("       View colored with: less -R <path>")
     else:
         if not args.quiet:
             print("[BATCH] No valid inputs processed.")
 
+
 if __name__ == "__main__":
     main()
-
