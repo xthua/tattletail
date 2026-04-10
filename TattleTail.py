@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Tailocin Finder v1.1 (Full contig Prokka + core region filter)
-- Based on v1.0
+Tailocin Finder v1.0
 """
 
 import os
@@ -113,7 +112,7 @@ def write_cluster_gff3(outfile, contig_id, genes):
     """Generate standard GFF3 file for IGV/JBrowse/Artemis"""
     with open(outfile, "w", encoding="utf-8") as f:
         f.write("##gff-version 3\n")
-        f.write(f"# Tailocin Finder v3.20 - Core pyocin cluster annotations\n")
+        f.write(f"# TattleTail v1.0 \n")
         f.write(f"# Contig: {contig_id}\n")
         f.write(f"# Only core cluster genes annotated (absolute genomic coordinates)\n\n")
         
@@ -873,7 +872,7 @@ def build_parser():
     p.add_argument("--force-stdout", action="store_true", help="Force stdout even under non-tty")
     p.add_argument("--quiet", action="store_true", help="Do not print reports to stdout")
     p.add_argument("--dump-hits-tsv", action="store_true", help="Write hits_with_coords.tsv")
-    p.add_argument("--version", action="version", version="Tailocin Finder v3.20 (Full contig Prokka)")
+    p.add_argument("--version", action="version", version="TattleTail v1.0")
     return p
 
 def parse_args():
