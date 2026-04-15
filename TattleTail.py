@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Tailocin Finder v1.0
+TattleTail: Pyocin / Tailocin Prediction Tool (v1.0)
 """
 
 import os
@@ -12,7 +12,6 @@ import argparse
 import subprocess
 import json
 import shutil
-import tempfile
 from shutil import which
 from datetime import datetime
 from collections import defaultdict
@@ -22,7 +21,6 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio.SeqFeature import SeqFeature, FeatureLocation
-
 
 # --------------------------- ANSI tools ---------------------------
 
@@ -45,22 +43,31 @@ def open_log_append(path):
 def split_csv(s):
     return [x.strip() for x in s.split(",") if x.strip()]
 
-
-def check_prokka():
-    prokka_path = shutil.which("prokka")
-    if prokka_path is None:
+def check_bakta(bakta_db):
+    bakta_path = shutil.which("bakta")
+    if bakta_path is None:
         raise RuntimeError(
-            "ERROR: Prokka not found in PATH.\n"
-            "Please install Prokka or activate the correct conda environment."
+            "ERROR: Bakta not found in PATH.\n"
+            "Please install Bakta (conda install -c conda-forge -c bioconda bakta)."
         )
+    if bakta_db is None:
+        raise RuntimeError("ERROR: --bakta-db is required.")
+    if not os.path.exists(bakta_db) or not os.path.isdir(bakta_db):
+        raise RuntimeError(f"ERROR: Bakta database directory not found: {bakta_db}, please download Bakta database by command line.")
     try:
-        subprocess.run(["prokka", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(
+            ["bakta", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True
+        )
     except Exception:
-        raise RuntimeError("ERROR: Prokka detected but failed to run.\nPlease check your installation.")
+        raise RuntimeError(
+            "ERROR: Bakta detected but failed to run.\n"
+            "Please check your installation."
+        )
 
-
-def parse_prokka_gff(gff_file):
-    """Parse Prokka GFF3 file and extract CDS features"""
+def parse_gff3_genes(gff_file):
     genes = []
     with open(gff_file) as f:
         for line in f:
@@ -88,9 +95,8 @@ def parse_prokka_gff(gff_file):
             })
     return genes
 
-
 def write_cluster_gene_list(outfile, genes):
-    """Write gene list in the required format"""
+    """(2) requirement: all genes table (exact format)"""
     with open(outfile, "w") as f:
         f.write("#\tGene\tGene product\tGenomic position\n")
         for i, g in enumerate(genes, 1):
@@ -107,12 +113,11 @@ def write_cluster_gene_list(outfile, genes):
                 pos = f"{start_fmt} - {end_fmt}"
             f.write(f"{i}\t{gene}\t{product}\t{pos}\n")
 
-
 def write_cluster_gff3(outfile, contig_id, genes):
-    """Generate standard GFF3 file for IGV/JBrowse/Artemis"""
+    """Generate standard GFF3 file (best for IGV/JBrowse/Artemis)"""
     with open(outfile, "w", encoding="utf-8") as f:
         f.write("##gff-version 3\n")
-        f.write(f"# TattleTail v1.0 \n")
+        f.write(f"# Tailocin Finder v1.0 - Core pyocin cluster annotations\n")
         f.write(f"# Contig: {contig_id}\n")
         f.write(f"# Only core cluster genes annotated (absolute genomic coordinates)\n\n")
         
@@ -123,6 +128,7 @@ def write_cluster_gff3(outfile, contig_id, genes):
             gene   = g.get("gene", "unknown")
             product = g.get("product", "Hypothetical protein")
             
+            # sanitize attributes to prevent parsing errors
             product_safe = product.replace(';', ',').replace('=', '_').replace('"', "'")
             
             attributes = (
@@ -136,38 +142,24 @@ def write_cluster_gff3(outfile, contig_id, genes):
             
             f.write(f"{contig_id}\tTailocinFinder\tCDS\t{start}\t{end}\t.\t{strand}\t0\t{attributes}\n")
 
-def write_cluster_annotation_tsv(path, clusters_eval):
-    """(3) Write annotation table: locus tag + alignment statistics for each hit"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("cluster_id\tcontig\tstart\tend\tgene_id\tfunction\tpident\tlength\tbitscore\tevalue\n")
-        for idx, c in enumerate(clusters_eval, 1):
-            if not c["is_candidate"]:
-                continue
-            members_sorted = sorted(c["members"], key=lambda x: x["start"])
-            for m in members_sorted:
-                f.write(
-                    f"{idx}\t{c['contig']}\t{m['start']}\t{m['end']}\t{m['q']}\t{m['func']}\t"
-                    f"{m['pident']:.2f}\t{m['length']}\t{m['bitscore']:.1f}\t{m['evalue']:.2e}\n"
-                )
-
 # --------------------------- BLAST DB self-check ---------------------------
 
 def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailocin"):
     if not os.path.exists(db_fasta):
         if os.path.basename(db_fasta) == "database_tailocin.fasta":
-            print("ERROR: database_tailocin.fasta not exists", file=sys.stderr)
+            print("database_tailocin.fasta does not exist", file=sys.stderr)
         else:
-            print(f"[FATAL] DB FASTA not exists: {db_fasta}", file=sys.stderr)
+            print(f"[FATAL] DB FASTA does not exist: {db_fasta}", file=sys.stderr)
         sys.exit(2)
     idx_files = [db_name + ".pin", db_name + ".phr", db_name + ".psq"]
     have_index = all(os.path.exists(p) for p in idx_files)
     if not have_index:
         if which("makeblastdb") is None:
-            print("[FATAL] makeblastdb not exists", file=sys.stderr)
-            print("        Please install BLAST+ (e.g. conda install -c bioconda blast)", file=sys.stderr)
+            print("[FATAL] makeblastdb not found in PATH", file=sys.stderr)
+            print("        Please install BLAST+ (example: conda install -c bioconda blast)", file=sys.stderr)
         cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
         print("[FATAL] BLAST database index not found:", db_name, file=sys.stderr)
-        print("        Please create index with the following command:", file=sys.stderr)
+        print("        Please create the index first (copy and run the command below):", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
         sys.exit(2)
     ok = True
@@ -181,8 +173,8 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
             ok = False
     if not ok:
         cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
-        print("[FATAL] Database index exists but is unreadable:", db_name, file=sys.stderr)
-        print("        It is recommended to rebuild the index:", file=sys.stderr)
+        print("[FATAL] BLAST database index exists but is unreadable:", db_name, file=sys.stderr)
+        print("        Rebuild the index with:", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
         sys.exit(2)
     try:
@@ -190,7 +182,7 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
         idx_mtime = min(os.path.getmtime(p) for p in idx_files)
         if fasta_mtime > idx_mtime:
             cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
-            print("[WARN] DB FASTA is newer than BLAST index. It is recommended to rebuild the index:", file=sys.stderr)
+            print("[WARN] DB FASTA is newer than BLAST index. Rebuild the index to keep consistency:", file=sys.stderr)
             print("       " + cmd, file=sys.stderr)
     except Exception:
         pass
@@ -203,22 +195,21 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
                     if len(parts) < 2:
                         bad += 1
         if bad > 0:
-            print(f"[FATAL] {db_fasta} has {bad} headers without second token (function label).", file=sys.stderr)
-            print("        Header must satisfy format: '>ID LABEL [optional]'", file=sys.stderr)
+            print(f"[FATAL] {db_fasta} contains {bad} headers without a second token (functional label).", file=sys.stderr)
+            print("        Headers must follow format: '>ID LABEL [optional]'", file=sys.stderr)
             print("        Example: '>BAR70105.1 integrase_1 [Pseudomonas aeruginosa]'", file=sys.stderr)
             sys.exit(2)
     except Exception:
         pass
 
-
-# --------------------------- Other functions ------------------------------------
+# --------------------------- other functions ---------------------------
 
 def check_dependencies(require_prodigal=True, require_blastp=True):
     ok = True
     if require_prodigal and which("prodigal") is None:
-        print("prodigal not exists", file=sys.stderr); ok = False
+        print("prodigal not found in PATH", file=sys.stderr); ok = False
     if require_blastp and which("blastp") is None:
-        print("blastp not exists", file=sys.stderr); ok = False
+        print("blastp not found in PATH", file=sys.stderr); ok = False
     if not ok:
         sys.exit(1)
 
@@ -256,6 +247,8 @@ def translate_ffn_to_faa(ffn_file, faa_file, genetic_code=11, partial_policy="tr
             elif partial_policy == "skip":
                 log(f"{record.id}: length {len(clean)} not multiple of 3; skipped")
                 continue
+            elif partial_policy == "error":
+                raise ValueError(f"{record.id}: CDS length {len(clean)} not multiple of 3")
             else:
                 log(f"{record.id}: unknown partial_policy={partial_policy}; trimming by default")
                 clean = clean[:len(clean) - rem]
@@ -266,10 +259,7 @@ def translate_ffn_to_faa(ffn_file, faa_file, genetic_code=11, partial_policy="tr
 
 def prodigal_mode_fix(mode):
     mode = str(mode).lower()
-    if mode == "meta":
-        return "meta"
-    else:
-        return "single" 
+    return "meta" if mode == "meta" else "single"
 
 def run_prodigal(nucl_fasta, faa_out, prodigal_mode="meta", genetic_code=11, log_path=None):
     cmd = ["prodigal", "-i", nucl_fasta, "-a", faa_out, "-p", prodigal_mode_fix(prodigal_mode), "-q", "-g", str(genetic_code)]
@@ -312,10 +302,18 @@ def parse_functional_mapping(database_fasta):
     with open(database_fasta, errors="ignore") as f:
         for line in f:
             if line.startswith('>'):
-                parts = line.strip().split()
-                prot_id = parts[0][1:]
-                label = parts[1]
+                header = line.strip()[1:].strip()         
+                space_parts = header.split(maxsplit=1)    
+                prot_id = space_parts[0]                 
+                
+                if len(space_parts) > 1 and '~~~' in space_parts[1]:
+                    tilde_parts = space_parts[1].split('~~~')
+                    label = tilde_parts[0].strip() if tilde_parts else prot_id
+                else:
+                    label = prot_id
+                
                 function = label.split('_')[0].lower()
+                
                 id_to_function[prot_id] = function
                 id_to_label[prot_id] = label
     return id_to_function, id_to_label
@@ -602,7 +600,6 @@ def write_report_and_json(
         else:
             rpt.write("No clusters produced or no hits with coordinates (see run.log).\n\n")
         rpt.write(f"Conclusion: {conclusion_text}\n")
-
     out = {
         "sample": sample_name,
         "params": params,
@@ -822,19 +819,22 @@ def collect_reports(results_root="results", out_tsv="batch_report.tsv", out_json
             print(f"[{mark}] {r['sample']}  candidates={r['candidates']}  spans={r['candidate_spans']}  sizes_kb={r['cluster_sizes_kb']}")
     return records
 
-
 # --------------------------- CLI ---------------------------
 
 EXAMPLES_TEXT = """\
 Examples:
-  # Single sample (unannotated FASTA)
-  python TattleTail.py genome.fna -o results --window 15000 --min-cluster-span 13400
-  # Batch mode
-  python Tattletail.py assemblies/ -o results --window 15000
+  # Single sample (unannotated FASTA): 15kb window, cluster span >=13.4kb, bakta-db: bakta_db_light/db-light(default, please download)
+  python TattleTail.py genome.fna -o results --window 15000 --min-cluster-span 13400 --bakta-db db_dir
+  # Batch processing (mixed .fna and .ffn)
+  python TattleTail.py assemblies/ dataset_ffn/GC*/cds_from_genomic.ffn -o results --window 15000
+  # Specify custom database
+  python TattleTail.py genome.fna -o results --db-fasta database_tailocin.fasta --db-name database_tailocin
   # Print per-sample reports + export hit details
   python TattleTail.py genome.fna -o results --per-sample-stdout --force-stdout --dump-hits-tsv
   # Re-summarize previous results (no re-run)
   python TattleTail.py collect --results-root results --out-tsv all_results.tsv --out-json all_results.json --print
+  # Show all options
+  python TattleTail.py -h
 """
 
 class SmartHelp(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -842,8 +842,8 @@ class SmartHelp(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpForm
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="tailocin_finder.py",
-        description="Tailocin Finder (cluster-aware) — identify tailocin-encoding BGCs from genomes or FFN.",
+        prog="TattleTail.py",
+        description="TattleTail — Pyocin / Tailocin Prediction Tool",
         formatter_class=SmartHelp,
         epilog=EXAMPLES_TEXT
     )
@@ -860,13 +860,14 @@ def build_parser():
     p.add_argument("--min-cluster-span", type=int, default=0, help="Minimum cluster total span (bp)")
     p.add_argument("--block-scope", choices=["cluster","global"], default="cluster", help="Blocker scope")
     p.add_argument("--binary-output", action="store_true", help="Use binary wording in conclusion")
-    p.add_argument("--prodigal-mode", choices=["meta","single"], default="single", help="Prodigal mode")
+    p.add_argument("--prodigal-mode", choices=["meta","single"], default="meta", help="Prodigal mode")
     p.add_argument("--genetic_code", type=int, default=11, help="NCBI translation table")
     p.add_argument("--ffn-partial", choices=["trim","pad","skip","error"], default="trim", help="FFN partial policy")
     p.add_argument("--flanks",     default="trpE,trpG",                  help="Comma-separated flank markers")
     p.add_argument("--regulators", default="prtN,prtR",                  help="Comma-separated regulator markers")
     p.add_argument("--toxins",     default="holin,endolysin",            help="Comma-separated lysis markers")
     p.add_argument("--blockers",   default="capsid,terminase,integrase", help="Comma-separated phage blockers")
+    p.add_argument("--bakta-db", default=os.path.expanduser("bakta_db_light/db-light"), help="Path to Bakta database directory (required)")
     p.add_argument("--summary-file", default="", help="Append per-sample summary to this TSV")
     p.add_argument("--per-sample-stdout", action="store_true", help="Echo per-sample report to stdout (colored)")
     p.add_argument("--force-stdout", action="store_true", help="Force stdout even under non-tty")
@@ -877,7 +878,7 @@ def build_parser():
 
 def parse_args():
     if len(sys.argv) > 1 and sys.argv[1] == "collect":
-        cparser = argparse.ArgumentParser(prog="tailocin_finder.py collect", formatter_class=SmartHelp, epilog=EXAMPLES_TEXT)
+        cparser = argparse.ArgumentParser(prog="TattleTail.py collect", formatter_class=SmartHelp, epilog=EXAMPLES_TEXT)
         cparser.add_argument("--results-root", default="results", help="Root directory")
         cparser.add_argument("--out-tsv", default="batch_report.tsv", help="Output TSV")
         cparser.add_argument("--out-json", default="batch_report.json", help="Output JSON")
@@ -890,11 +891,36 @@ def parse_args():
         sys.exit(0)
     return parser.parse_args(), "run"
 
+# --------------------------- helper functions ---------------------------
 
-# --------------------------- Main analysis function ---------------------------
+def write_hits_tsv(path, ghits):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("qseqid\tcontig\tstart\tend\tfunc\tlabel\tpident\tlength\tbitscore\tevalue\n")
+        for h in ghits:
+            f.write("{q}\t{c}\t{s}\t{e}\t{func}\t{lab}\t{pi:.3f}\t{al}\t{bs:.1f}\t{ev:.2e}\n".format(
+                q=h["q"], c=h.get("contig",""), s=h.get("start",""), e=h.get("end",""),
+                func=h["func"], lab=h["label"], pi=h["pident"], al=h["length"],
+                bs=h["bitscore"], ev=h["evalue"]
+            ))
+
+def write_cluster_annotation_tsv(path, clusters_eval):
+    """(3) requirement table: locus tag + alignment statistics per hit"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("cluster_id\tcontig\tstart\tend\tgene_id\tfunction\tpident\tlength\tbitscore\tevalue\n")
+        for idx, c in enumerate(clusters_eval, 1):
+            if not c["is_candidate"]:
+                continue
+            members_sorted = sorted(c["members"], key=lambda x: x["start"])
+            for m in members_sorted:
+                f.write(
+                    f"{idx}\t{c['contig']}\t{m['start']}\t{m['end']}\t{m['q']}\t{m['func']}\t"
+                    f"{m['pident']:.2f}\t{m['length']}\t{m['bitscore']:.1f}\t{m['evalue']:.2e}\n"
+                )
+
+# --------------------------- main analysis function ---------------------------
 
 def analyze_file(
-    input_file, output_dir, db_name, db_fasta,
+    input_file, output_dir, db_name, db_fasta, bakta_db,
     flank_markers, regulatory_markers, toxin_markers, phage_blockers,
     evalue_thr, pident_thr, length_thr, bitscore_thr, threads,
     prodigal_mode, genetic_code, ffn_partial_policy,
@@ -1002,6 +1028,85 @@ def analyze_file(
                 )
                 clusters_eval = trim_cluster_by_flanks(clusters_eval, flank_markers)
 
+    # === Full-genome Bakta annotation (run only once per sample) ===
+    # This replaces the old per-cluster Bakta calls to avoid boundary drift
+    bakta_dir = os.path.join(output_dir, "bakta_full_genome")
+    full_gff = os.path.join(bakta_dir, f"{sample_name}.gff3")
+
+    if not os.path.exists(full_gff):
+        with open(run_log, "a") as lf:
+            lf.write(f"[INFO] Running Bakta on full genome: {input_file}\n")
+        cmd = [
+            "bakta",
+            "--db", bakta_db,
+            "--proteins", db_fasta,
+            "--output", bakta_dir,
+            "--prefix", sample_name,
+            "--force",
+            "--compliant",
+            "--skip-plot",
+            "--min-contig-length", "1",
+            "--keep-contig-headers",
+            input_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("=== Bakta ERROR ===")
+            print(result.stderr)
+            print("=== End of Bakta ERROR ===")
+            raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    full_genes = parse_gff3_genes(full_gff)
+    # === Load full genome for GBK generation ===
+    genome_dict = SeqIO.to_dict(SeqIO.parse(input_file, "fasta"))
+
+
+    # === Filter core genes from full-genome annotation ===
+    # 20260410: This replaces the old per-cluster Bakta logic
+    for idx, c in enumerate([c for c in clusters_eval if c["is_candidate"]], 1):
+        core_start = c["start"]
+        core_end   = c["end"]
+        
+        # Filter genes that fall inside the core cluster
+        core_genes = [g for g in full_genes 
+                      if core_start <= g["start"] <= core_end 
+                      and core_start <= g["end"] <= core_end]
+        
+        # (2) Write gene_list.tsv
+        gene_list_file = os.path.join(output_dir, f"cluster_{idx}_gene_list.tsv")
+        write_cluster_gene_list(gene_list_file, core_genes)
+        
+        # Write full-contig GFF3/GBK (only core genes)
+        write_cluster_gff3(
+            os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gff3"),
+            c["contig"],
+            core_genes
+        )
+
+        # 20260410: produce cluster_X_on_full_contig.gbk ===
+        if c["contig"] in genome_dict:
+            full_record = genome_dict[c["contig"]]
+            full_record.annotations["molecule_type"] = "DNA"
+            full_record.features = []
+
+            for g in core_genes:
+                start = g["start"] - 1
+                end   = g["end"]
+                strand_val = 1 if g["strand"] == "+" else -1
+                
+                feature = SeqFeature(
+                    FeatureLocation(start, end, strand=strand_val),
+                    type="CDS",
+                    qualifiers={
+                        "gene": g.get("gene", "unknown"),
+                        "product": g.get("product", "Hypothetical protein"),
+                        "locus_tag": g.get("gene", "unknown")
+                    }
+                )
+                full_record.features.append(feature)
+
+            full_gbk = os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gbk")
+            SeqIO.write(full_record, full_gbk, "genbank")
     params = {
         "evalue": evalue_thr, "pident": pident_thr, "length": length_thr, "bitscore": bitscore_thr,
         "window": window_bp, "min_cluster_span": (0 if min_cluster_span <= 0 else min_cluster_span),
@@ -1016,95 +1121,15 @@ def analyze_file(
 
     n_cand = sum(1 for c in clusters_eval if c["is_candidate"])
 
+    # (3) BLAST hits statistics table
     if n_cand > 0:
         annotation_path = os.path.join(output_dir, "cluster_annotation.tsv")
         write_cluster_annotation_tsv(annotation_path, clusters_eval)
         with open_log_append(run_log) as lf:
             lf.write(f"[INFO] (3) Wrote cluster_annotation.tsv with {n_cand} candidate clusters\n")
 
-    # ====================== Full contig Prokka + core filter ======================
-    if n_cand > 0:
-        genome_dict = SeqIO.to_dict(SeqIO.parse(input_file, "fasta"))
-        for idx, c in enumerate([c for c in clusters_eval if c["is_candidate"]], 1):
-            contig_id = c["contig"]
-            if contig_id not in genome_dict:
-                with open_log_append(run_log) as lf:
-                    lf.write(f"[ERROR] Contig {contig_id} not found in input fasta.\n")
-                continue
-
-            prokka_dir = os.path.join(output_dir, f"prokka_cluster_{idx}")
-            gff_file = os.path.join(prokka_dir, f"{contig_id}.gff")
-
-            with open_log_append(run_log) as lf:
-                lf.write(f"[INFO] Running Prokka on full contig {contig_id} for cluster {idx}\n")
-
-            try:
-                cmd = [
-                    "prokka", "--outdir", prokka_dir, "--prefix", contig_id,
-                    "--kingdom", "Bacteria", "--force", "--quiet", "--cpus", "4",
-                    "--mincontiglen", "1", 
-                    "--proteins", db_fasta,
-                    "--fast",
-                    input_file                      # Use full genome/contig
-                ]
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-
-                if os.path.exists(gff_file):
-                    genes = parse_prokka_gff(gff_file)
-
-                    # Filter only genes inside the core cluster region
-                    core_start = c["start"]
-                    core_end   = c["end"]
-                    core_genes = [g for g in genes 
-                                  if core_start <= g["start"] <= core_end 
-                                  and core_start <= g["end"] <= core_end]
-
-                    # Write gene list
-                    gene_list_file = os.path.join(output_dir, f"cluster_{idx}_gene_list.tsv")
-                    write_cluster_gene_list(gene_list_file, core_genes)
-
-                    with open_log_append(run_log) as lf:
-                        lf.write(f"[INFO] (2) Wrote core gene list: {gene_list_file} ({len(core_genes)} genes)\n")
-
-                    # Generate full-contig GBK and GFF3 with only core genes
-                    full_record = genome_dict[contig_id]
-                    full_record.annotations["molecule_type"] = "DNA"
-                    full_record.features = []
-                    
-                    for g in core_genes:
-                        start = g["start"] - 1
-                        end   = g["end"]
-                        strand_val = 1 if g["strand"] == "+" else -1
-                        feature = SeqFeature(
-                            FeatureLocation(start, end, strand=strand_val),
-                            type="CDS",
-                            qualifiers={
-                                "gene": g.get("gene", "unknown"),
-                                "product": g.get("product", "Hypothetical protein"),
-                                "locus_tag": g.get("gene", "unknown")
-                            }
-                        )
-                        full_record.features.append(feature)
-                    
-                    full_gbk = os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gbk")
-                    SeqIO.write(full_record, full_gbk, "genbank")
-
-                    full_gff3 = os.path.join(output_dir, f"cluster_{idx}_on_full_contig.gff3")
-                    write_cluster_gff3(full_gff3, contig_id, core_genes)
-
-                    with open_log_append(run_log) as lf:
-                        lf.write(f"[INFO] Generated cluster_{idx} full-contig GBK and GFF3\n")
-
-                else:
-                    with open_log_append(run_log) as lf:
-                        lf.write(f"[WARN] No GFF from Prokka for cluster {idx}\n")
-
-            except subprocess.CalledProcessError as e:
-                with open_log_append(run_log) as lf:
-                    lf.write(f"[ERROR] Prokka failed for cluster {idx}: returncode {e.returncode}\n")
-                continue
-
     binary = 1 if n_cand > 0 else 0
+
     if summary_file_path:
         with open(summary_file_path, "a", encoding="utf-8") as sf:
             sf.write(f"{sample_name}\t{n_cand}\t{binary}\n")
@@ -1154,13 +1179,12 @@ def list_input_files(paths):
             print(f"[WARNING] Skipping unsupported input: {p}")
     return files
 
-
 def main():
-    check_prokka()
     args, mode = parse_args()
     if mode == "collect":
         collect_reports(results_root=args.results_root, out_tsv=args.out_tsv, out_json=args.out_json, do_print=args.do_print)
         return
+    check_bakta(args.bakta_db)
     check_dependencies(require_prodigal=True, require_blastp=True)
     ensure_blast_db(db_fasta=args.db_fasta, db_name=args.db_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1179,7 +1203,7 @@ def main():
         sample_name = os.path.splitext(os.path.basename(input_file))[0]
         output_dir = os.path.join(results_root, f"{sample_name}_{timestamp}")
         rec = analyze_file(
-            input_file, output_dir, args.db_name, args.db_fasta,
+            input_file, output_dir, args.db_name, args.db_fasta, args.bakta_db,
             flank_markers, regulatory_markers, toxin_markers, phage_blockers,
             args.evalue, args.pident, args.length, args.bitscore, args.threads,
             args.prodigal_mode, args.genetic_code, args.ffn_partial,
@@ -1202,7 +1226,6 @@ def main():
     else:
         if not args.quiet:
             print("[BATCH] No valid inputs processed.")
-
 
 if __name__ == "__main__":
     main()
