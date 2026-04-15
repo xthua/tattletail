@@ -34,29 +34,18 @@ cd tattletail
 Create and activate a conda environment:
 
 ```bash
-conda create -n tailocin python=3.9
-conda activate tailocin
+conda create -n tattletail_env python=3.9
+conda activate tattletail_env
 ```
 
 Install dependencies:
 
 ```bash
-conda install -c bioconda prodigal blast biopython prokka
+conda install -c bioconda prodigal blast biopython bakta
 pip install termcolor
 ```
 
 (If `termcolor` is already installed via conda, the pip step can be skipped.)
-
----
-
-### Create environment from file
-
-Instead of installing packages individually, you can create the full environment with:
-
-```bash
-conda env create -f environment.yml
-conda activate tailocin_env
-```
 
 ---
 
@@ -72,7 +61,7 @@ conda activate tailocin_env
 
 - Prodigal ≥ 2.6.3
 - BLAST+ ≥ 2.16.0
-- Prokka ≥ 1.15.6
+- Bakta ≥ 1.12.0
 
 Required BLAST programs:
 
@@ -87,7 +76,7 @@ prodigal -v
 blastp -version
 makeblastdb -version
 blastdbcmd -version
-prokka --version
+bakta --version
 ```
 
 ---
@@ -96,13 +85,14 @@ prokka --version
 
 ### Single sample (FASTA input)
 
-15 kb window, minimum cluster span ≥ 13.4 kb
+15 kb window, minimum cluster span ≥ 13.4 kb, bakta-db: bakta_db_light/db-light(default, please download)
 
 ```bash
 python TattleTail.py genome.fna \
     -o results \
     --window 15000 \
-    --min-cluster-span 13400
+    --min-cluster-span 13400 \
+    --bakta-db db_dir
 ```
 
 ---
@@ -167,13 +157,13 @@ TattleTail requires a custom BLAST protein database.
 Required FASTA header format:
 
 ```
->ID LABEL [optional description]
+>ID LABEL~~~genename[optional description]~~~
 ```
 
 Example:
 
 ```
->BAR70105.1 integrase_1 [Pseudomonas aeruginosa]
+>BAR70105.1 integrase_1~~~integrase[Pseudomonas aeruginosa]
 ```
 
 Build database:
@@ -203,7 +193,7 @@ cluster_annotation.tsv
 cluster_{n}_gene_list.tsv
 cluster_{n}_on_full_contig.gbk
 cluster_{n}_on_full_contig.gff3
-prokka_cluster_{n}
+bakta_full_genome
 ```
 
 Description:
@@ -219,7 +209,7 @@ Description:
 | cluster_{n}_gene_list.tsv | gene cluster annotations list |
 | cluster_{n}_on_full_contig.gbk | detailed gene cluster annotations |
 | cluster_{n}_on_full_contig.gff3 | detailed gene cluster annotations |
-| prokka_cluster_{n} | prokka annotate dir |
+| bakta_full_genome | bakta annotate dir |
 
 ---
 
