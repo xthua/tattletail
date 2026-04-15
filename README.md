@@ -85,7 +85,7 @@ bakta --version
 
 ### Single sample (FASTA input)
 
-15 kb window, minimum cluster span ≥ 13.4 kb, bakta-db: bakta_db_light/db-light(default, please download)
+15 kb window, minimum cluster span ≥ 13.4 kb, bakta-db: bakta_db_light/db-light(default, please download, see [Bakta](https://github.com/oschwengers/bakta))
 
 ```bash
 python TattleTail.py genome.fna \
