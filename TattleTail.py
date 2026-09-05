@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# TattleTail v1.0
 
 """
 TattleTail: Pyocin / Tailocin Prediction Tool (v1.0)
