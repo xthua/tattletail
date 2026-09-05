@@ -157,7 +157,7 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
         if which("makeblastdb") is None:
             print("[FATAL] makeblastdb not found in PATH", file=sys.stderr)
             print("        Please install BLAST+ (example: conda install -c bioconda blast)", file=sys.stderr)
-        cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
+        cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}"'
         print("[FATAL] BLAST database index not found:", db_name, file=sys.stderr)
         print("        Please create the index first (copy and run the command below):", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
@@ -172,7 +172,7 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
         except Exception:
             ok = False
     if not ok:
-        cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
+        cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}"'
         print("[FATAL] BLAST database index exists but is unreadable:", db_name, file=sys.stderr)
         print("        Rebuild the index with:", file=sys.stderr)
         print("        " + cmd, file=sys.stderr)
@@ -181,7 +181,7 @@ def ensure_blast_db(db_fasta="database_tailocin.fasta", db_name="database_tailoc
         fasta_mtime = os.path.getmtime(db_fasta)
         idx_mtime = min(os.path.getmtime(p) for p in idx_files)
         if fasta_mtime > idx_mtime:
-            cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}" -parse_seqids'
+            cmd = f'makeblastdb -in "{db_fasta}" -dbtype prot -out "{db_name}"'
             print("[WARN] DB FASTA is newer than BLAST index. Rebuild the index to keep consistency:", file=sys.stderr)
             print("       " + cmd, file=sys.stderr)
     except Exception:
@@ -431,7 +431,7 @@ def join_hits_with_coords(hits, qcoords):
             ghits.append(gh)
     return ghits
 
-def cluster_by_window(ghits, window_bp=10000):
+def cluster_by_window(ghits, window_bp=15000):
     by_contig = defaultdict(list)
     for gh in ghits:
         by_contig[gh["contig"]].append(gh)
@@ -475,6 +475,7 @@ def evaluate_clusters_strict(
             "contig": clu["contig"],
             "start":  clu["start"],
             "end":    clu["end"],
+            "core_defined": False,
             "members": clu["members"],
             "funcs":   funcs,
             "step1_ok": step1_ok, "step1_reason": None if step1_ok else "Missing flanking pair (trpE & trpG)",
@@ -488,7 +489,7 @@ def evaluate_clusters_strict(
 def trim_cluster_by_flanks(cluster_eval, flank_markers=("trpE","trpG")):
     flank_set = set(x.lower() for x in flank_markers)
     for c in cluster_eval:
-        if not c["is_candidate"]:
+        if not c["step1_ok"]:
             continue
         flank_hits = [m for m in c["members"] if m["func"].lower() in flank_set]
         if len(flank_hits) < 2:
@@ -506,6 +507,7 @@ def trim_cluster_by_flanks(cluster_eval, flank_markers=("trpE","trpG")):
             continue
         c["start"] = new_start
         c["end"] = new_end
+        c["core_defined"] = True
         new_members = []
         for m in c["members"]:
             if m["func"].lower() in flank_set:
@@ -515,6 +517,50 @@ def trim_cluster_by_flanks(cluster_eval, flank_markers=("trpE","trpG")):
         c["members"] = new_members
         c["funcs"] = set(m["func"].lower() for m in new_members)
     return cluster_eval
+
+def evaluate_trimmed_clusters(
+    clusters_eval,
+    blockers=("capsid","terminase","integrase"),
+    regulators=("prtN","prtR"),
+    toxins=("holin","endolysin"),
+    min_cluster_span=0
+):
+    set_block = set(x.lower() for x in blockers)
+    set_reg = set(x.lower() for x in regulators)
+    set_tox = set(x.lower() for x in toxins)
+    minimum = max(0, int(min_cluster_span or 0))
+
+    for c in clusters_eval:
+        if not c.get("core_defined", False):
+            c["core_span"] = None
+            c["step5_ok"] = False
+            c["step5_reason"] = "Unable to define an inter-flank core region"
+            c["is_candidate"] = False
+            continue
+
+        funcs = set(m["func"].lower() for m in c["members"])
+        c["funcs"] = funcs
+
+        step2_ok = len(funcs & set_block) == 0
+        step3_ok = set_reg.issubset(funcs)
+        step4_ok = set_tox.issubset(funcs)
+        core_span = c["end"] - c["start"] + 1
+        step5_ok = minimum <= 0 or core_span >= minimum
+
+        c["step2_ok"] = step2_ok
+        c["step2_reason"] = None if step2_ok else "Blocker(s) present in trimmed core (capsid/terminase/integrase)"
+        c["step3_ok"] = step3_ok
+        c["step3_reason"] = None if step3_ok else "Missing regulators from trimmed core (prtN & prtR)"
+        c["step4_ok"] = step4_ok
+        c["step4_reason"] = None if step4_ok else "Missing lysis genes from trimmed core (holin & endolysin)"
+        c["core_span"] = core_span
+        c["step5_ok"] = step5_ok
+        c["step5_reason"] = None if step5_ok else f"Trimmed core span below minimum ({core_span} < {minimum} bp)"
+        c["is_candidate"] = (
+            c["step1_ok"] and step2_ok and step3_ok and step4_ok and step5_ok
+        )
+
+    return clusters_eval
 
 def top_hits_by_function(hits):
     best = {}
@@ -566,8 +612,11 @@ def write_report_and_json(
         if clusters_eval:
             rpt.write("Cluster-level results:\n")
             for idx, c in enumerate(clusters_eval, 1):
-                span_kb = (c["end"] - c["start"] + 1) / 1000.0
-                rpt.write(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)={c['start']}..{c['end']}  ({span_kb:.2f} kb)\n")
+                if c.get("core_defined"):
+                    span_kb = c["core_span"] / 1000.0
+                    rpt.write(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)={c['start']}..{c['end']}  ({span_kb:.2f} kb)\n")
+                else:
+                    rpt.write(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)=N/A\n")
                 funcs_sorted = sorted(c["funcs"])
                 rpt.write(f"  functions (core pyocin genes): {', '.join(funcs_sorted)}\n")
                 rpt.write("  Steps:\n")
@@ -580,6 +629,11 @@ def write_report_and_json(
                 rpt.write(f"    4) lysis (holin & endolysin): {'PASS' if c['step4_ok'] else 'FAIL'}"
                           + ("" if c['step4_ok'] else f" — {c['step4_reason']}") + "\n")
                 verdict = "TAILOCIN CANDIDATE ✅" if c["is_candidate"] else "not a candidate ❌"
+                rpt.write(
+                    f"    5) minimum trimmed core span: {'PASS' if c.get('step5_ok', False) else 'FAIL'}"
+                    + ("" if c.get("step5_ok", False) else f" -- {c.get('step5_reason', 'Core span check failed')}")
+                    + "\n"
+                )
                 rpt.write(f"  verdict: {verdict}\n")
                 if c["is_candidate"]:
                     rpt.write("\n  Core genes in this candidate cluster (sorted by genomic position):\n\n")
@@ -614,15 +668,21 @@ def write_report_and_json(
         cluster_dict = {
             "cluster_id": idx,
             "contig": c["contig"],
-            "start": c["start"],
-            "end": c["end"],
+            "start": c["start"] if c.get("core_defined") else None,
+            "end": c["end"] if c.get("core_defined") else None,
+            "core_span": c.get("core_span"),
+            "core_defined": c.get("core_defined", False),
             "functions": sorted(list(c["funcs"])),
             "is_candidate": c["is_candidate"],
             "steps": {
                 "step1_flanks": {"ok": c["step1_ok"], "reason": c["step1_reason"]},
                 "step2_blockers_absent": {"ok": c["step2_ok"], "reason": c["step2_reason"]},
                 "step3_regulators": {"ok": c["step3_ok"], "reason": c["step3_reason"]},
-                "step4_lysis": {"ok": c["step4_ok"], "reason": c["step4_reason"]}
+                "step4_lysis": {"ok": c["step4_ok"], "reason": c["step4_reason"]},
+                "step5_minimum_core_span": {
+                    "ok": c.get("step5_ok", False),
+                    "reason": c.get("step5_reason")
+                }
             },
             "top_hits": top_hits_by_function(c["members"])
         }
@@ -672,8 +732,11 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
     if clusters_eval:
         print("Cluster-level results:")
         for idx, c in enumerate(clusters_eval, 1):
-            span_kb = (c["end"] - c["start"] + 1) / 1000.0
-            print(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)={c['start']}..{c['end']}  ({span_kb:.2f} kb)")
+            if c.get("core_defined"):
+                span_kb = c["core_span"] / 1000.0
+                print(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)={c['start']}..{c['end']}  ({span_kb:.2f} kb)")
+            else:
+                print(f"Cluster #{idx}  contig={c['contig']}  core span (trimmed)=N/A")
             funcs_sorted = sorted(c["funcs"])
             print(f"  functions (core): {', '.join(funcs_sorted)}")
             print("  Steps:")
@@ -683,6 +746,10 @@ def print_report_to_console(sample_name, params, found_functions_global, cluster
             print(f"    3) regulators:               {pf(c['step3_ok'])}" + ("" if c['step3_ok'] else f" — {c['step3_reason']}"))
             print(f"    4) lysis genes:              {pf(c['step4_ok'])}" + ("" if c['step4_ok'] else f" — {c['step4_reason']}"))
             verdict = colored("TAILOCIN CANDIDATE ✅", "green") if c["is_candidate"] else colored("not a candidate ❌", "red")
+            print(
+                f"    5) minimum core span:        {pf(c.get('step5_ok', False))}"
+                + ("" if c.get("step5_ok", False) else f" -- {c.get('step5_reason', 'Core span check failed')}")
+            )
             print(f"  verdict: {verdict}")
             if c["is_candidate"]:
                 print("\n  Core genes (sorted by position):")
@@ -856,7 +923,7 @@ def build_parser():
     p.add_argument("--length",   type=int,   default=50,    help="Alignment length cutoff")
     p.add_argument("--bitscore", type=float, default=50.0,  help="Bitscore cutoff")
     p.add_argument("--threads",  type=int,   default=None,  help="blastp threads")
-    p.add_argument("--window", type=int, default=10000, help="Cluster window (bp)")
+    p.add_argument("--window", type=int, default=15000, help="Cluster window (bp)")
     p.add_argument("--min-cluster-span", type=int, default=0, help="Minimum cluster total span (bp)")
     p.add_argument("--block-scope", choices=["cluster","global"], default="cluster", help="Blocker scope")
     p.add_argument("--binary-output", action="store_true", help="Use binary wording in conclusion")
@@ -1021,12 +1088,22 @@ def analyze_file(
             if ghits:
                 clusters = cluster_by_window(ghits, window_bp=window_bp)
                 if min_cluster_span and min_cluster_span > 0:
-                    clusters = [c for c in clusters if (c["end"] - c["start"] + 1) >= min_cluster_span]
+                    clusters = [
+                        c for c in clusters
+                        if (c["end"] - c["start"] + 1) >= min_cluster_span
+                    ]
                 clusters_eval = evaluate_clusters_strict(
                     clusters, flank=tuple(flank_markers), blockers=tuple(phage_blockers),
                     regulators=tuple(regulatory_markers), toxins=tuple(toxin_markers)
                 )
                 clusters_eval = trim_cluster_by_flanks(clusters_eval, flank_markers)
+                clusters_eval = evaluate_trimmed_clusters(
+                    clusters_eval,
+                    blockers=tuple(phage_blockers),
+                    regulators=tuple(regulatory_markers),
+                    toxins=tuple(toxin_markers),
+                    min_cluster_span=min_cluster_span
+                )
 
     # === Full-genome Bakta annotation (run only once per sample) ===
     # This replaces the old per-cluster Bakta calls to avoid boundary drift
@@ -1043,7 +1120,7 @@ def analyze_file(
             "--output", bakta_dir,
             "--prefix", sample_name,
             "--force",
-            "--compliant",
+            #"--compliant", ##20260801 produce the full name of contig
             "--skip-plot",
             "--min-contig-length", "1",
             "--keep-contig-headers",
@@ -1229,3 +1306,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
