@@ -1,0 +1,13 @@
+name: tattletail_env
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - python=3.10.20
+  - biopython=1.87
+  - termcolor=3.3.0
+  - prodigal=2.6.3
+  - blast=2.17.0
+  - bakta=1.12.0
