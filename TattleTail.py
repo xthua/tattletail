@@ -524,7 +524,7 @@ def evaluate_trimmed_clusters(
     blockers=("capsid","terminase","integrase"),
     regulators=("prtN","prtR"),
     toxins=("holin","endolysin"),
-    min_cluster_span=0
+    min_cluster_span=13400
 ):
     set_block = set(x.lower() for x in blockers)
     set_reg = set(x.lower() for x in regulators)
@@ -925,7 +925,7 @@ def build_parser():
     p.add_argument("--bitscore", type=float, default=50.0,  help="Bitscore cutoff")
     p.add_argument("--threads",  type=int,   default=None,  help="blastp threads")
     p.add_argument("--window", type=int, default=15000, help="Cluster window (bp)")
-    p.add_argument("--min-cluster-span", type=int, default=0, help="Minimum cluster total span (bp)")
+    p.add_argument("--min-cluster-span", type=int, default=13400, help="Minimum trimmed inter-flank core span length (bp); use 0 to disable this filter")
     p.add_argument("--block-scope", choices=["cluster","global"], default="cluster", help="Blocker scope")
     p.add_argument("--binary-output", action="store_true", help="Use binary wording in conclusion")
     p.add_argument("--prodigal-mode", choices=["meta","single"], default="meta", help="Prodigal mode")
