@@ -157,7 +157,7 @@ python TattleTail.py \
     --min-cluster-span 13400 
 ```
 
-This smoke test reproduces the settings used in the reported analyses. The program default for `--min-cluster-span` is `0`.
+This smoke test reproduces the settings used in the reported analyses. The program default for `--min-cluster-span` is `13400`.
 
 The summary should report:
 
@@ -217,7 +217,7 @@ nohup python TattleTail.py dataset/*/*.fna \
 | `--length` | `50` | `50` | Minimum alignment length (aa) |
 | `--bitscore` | `50` | `50` | Minimum BLASTP bit score |
 | `--window` | `15000` | `15000` | Maximum separation between consecutive qualifying hits |
-| `--min-cluster-span` | `0` | `13400` | Minimum trimmed core length; `0` disables the filter |
+| `--min-cluster-span` | `13400` | `13400` | Minimum trimmed core length; `0` disables the filter |
 | `--block-scope` | `cluster` | `cluster` | Scope of the phage-blocker rule |
 | `--prodigal-mode` | `meta` | `meta` | Prodigal mode |
 | `--genetic_code` | `11` | `11` | Prodigal translation table |
@@ -251,7 +251,7 @@ The 15,000-bp default was selected empirically using 98 genomes with manually id
 
 ### Minimum cluster span
 
-For the reported analyses, 13,400 bp was set below the smallest positive core observed among the 98 positive genomes analysed with a 15,000-bp window. It suppresses clearly short, fragmented, or redundant clusters. This is an empirical reporting filter, not a universal biological minimum. The program default is `0`.
+For the reported analyses, 13,400 bp was set below the smallest positive core observed among the 98 positive genomes analysed with a 15,000-bp window. It suppresses clearly short, fragmented, or redundant clusters. This is an empirical reporting filter, not a universal biological minimum. The program default is `13,400 bp`; users can explicitly set `--min-cluster-span 0` to disable this filter.
 
 ### Blocker scope
 
