@@ -337,7 +337,10 @@ This table helps explain cluster breaks and blocker decisions.
 
 ## Citation
 
+If you use TattleTail in your research, please cite:
+
 Rayhaan G. Pais, Weilian Chen, Sebastian Leptihn, Xiaoting Hua, Belinda Loh  
-*TattleTail: A Pyocin Prediction Tool.*  
-bioRxiv (2026).  
-https://doi.org/10.64898/2026.03.25.712926
+TattleTail: A Rule-Based Tool for Identifying Canonical Pyocin-Encoding Gene Clusters in *Pseudomonas aeruginosa*.  
+Computational and Structural Biotechnology Journal. 2026;35(1):0230.  
+https://doi.org/10.34133/csbj.0230  
+
